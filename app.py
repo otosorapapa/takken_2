@@ -1124,9 +1124,24 @@ def inject_ui_styles() -> None:
     gap: 0.75rem;
     margin-bottom: 0.5rem;
 }
+.takken-action-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin: 1rem 0;
+}
+.takken-action-item {
+    flex: 1 1 160px;
+}
 @media (max-width: 768px) {
     .takken-choice-grid {
         grid-template-columns: 1fr;
+    }
+    .takken-action-bar {
+        flex-direction: column;
+    }
+    .takken-action-item {
+        width: 100%;
     }
 }
 .takken-inline-actions button {
@@ -2431,64 +2446,79 @@ def render_question_interaction(
     flag_label = "フラグ解除" if flagged else "復習フラグ"
     help_label = "ヘルプ"
     auto_advance_enabled = st.session_state["settings"].get("auto_advance", False)
-    action_cols = st.columns(5)
-    with action_cols[0]:
-        grade_clicked = st.button(
-            grade_label,
-            key=f"{key_prefix}_grade_{row['id']}",
-            use_container_width=True,
-            type="primary",
-        )
-    with action_cols[1]:
-        if st.button(
-            explanation_label,
-            key=f"{key_prefix}_toggle_explanation_{row['id']}",
-            use_container_width=True,
-        ):
-            show_explanation = not show_explanation
-            st.session_state[explanation_key] = show_explanation
-    with action_cols[2]:
-        if st.button(
-            flag_label,
-            key=f"{key_prefix}_flag_{row['id']}",
-            use_container_width=True,
-        ):
-            flags = set(st.session_state.get("review_flags", []))
-            if flagged:
-                flags.discard(row["id"])
-            else:
-                flags.add(row["id"])
-            st.session_state["review_flags"] = list(flags)
-            flagged = row["id"] in flags
-    with action_cols[3]:
-        help_visible = st.session_state.get(help_state_key, False)
-        if st.button(
-            help_label,
-            key=f"{key_prefix}_help_{row['id']}",
-            use_container_width=True,
-        ):
-            help_visible = not help_visible
-            st.session_state[help_state_key] = help_visible
-        else:
-            help_visible = st.session_state.get(help_state_key, False)
-    with action_cols[4]:
-        if st.button(
-            "SRSリセット",
-            key=f"{key_prefix}_srs_reset_{row['id']}",
-            use_container_width=True,
-        ):
-            db.upsert_srs(
-                row["id"],
-                {
-                    "repetition": 0,
-                    "interval": 1,
-                    "ease": st.session_state["settings"].get("sm2_initial_ease", 2.5),
-                    "due_date": dt.date.today(),
-                    "last_grade": None,
-                    "updated_at": dt.datetime.now(),
-                },
-            )
-            st.success("SRSを初期化しました。明日から復習に再投入されます。")
+    grade_clicked = False
+    help_visible = st.session_state.get(help_state_key, False)
+    action_buttons = [
+        {
+            "id": "grade",
+            "label": grade_label,
+            "key": f"{key_prefix}_grade_{row['id']}",
+            "type": "primary",
+        },
+        {
+            "id": "toggle_explanation",
+            "label": explanation_label,
+            "key": f"{key_prefix}_toggle_explanation_{row['id']}",
+        },
+        {
+            "id": "flag",
+            "label": flag_label,
+            "key": f"{key_prefix}_flag_{row['id']}",
+        },
+        {
+            "id": "help",
+            "label": help_label,
+            "key": f"{key_prefix}_help_{row['id']}",
+        },
+        {
+            "id": "srs_reset",
+            "label": "SRSリセット",
+            "key": f"{key_prefix}_srs_reset_{row['id']}",
+        },
+    ]
+    with st.container():
+        st.markdown('<div class="takken-action-bar">', unsafe_allow_html=True)
+        for action in action_buttons:
+            st.markdown('<div class="takken-action-item">', unsafe_allow_html=True)
+            button_kwargs = {
+                "key": action["key"],
+                "use_container_width": True,
+            }
+            if "type" in action:
+                button_kwargs["type"] = action["type"]
+            clicked = st.button(action["label"], **button_kwargs)
+            if action["id"] == "grade" and clicked:
+                grade_clicked = True
+            elif action["id"] == "toggle_explanation" and clicked:
+                show_explanation = not show_explanation
+                st.session_state[explanation_key] = show_explanation
+            elif action["id"] == "flag" and clicked:
+                flags = set(st.session_state.get("review_flags", []))
+                if flagged:
+                    flags.discard(row["id"])
+                else:
+                    flags.add(row["id"])
+                st.session_state["review_flags"] = list(flags)
+            elif action["id"] == "help" and clicked:
+                help_visible = not help_visible
+                st.session_state[help_state_key] = help_visible
+            elif action["id"] == "srs_reset" and clicked:
+                db.upsert_srs(
+                    row["id"],
+                    {
+                        "repetition": 0,
+                        "interval": 1,
+                        "ease": st.session_state["settings"].get("sm2_initial_ease", 2.5),
+                        "due_date": dt.date.today(),
+                        "last_grade": None,
+                        "updated_at": dt.datetime.now(),
+                    },
+                )
+                st.success("SRSを初期化しました。明日から復習に再投入されます。")
+            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    flagged = row["id"] in set(st.session_state.get("review_flags", []))
+    help_visible = st.session_state.get(help_state_key, help_visible)
     if auto_advance_enabled and navigation and navigation.has_next:
         st.caption("採点後0.8秒で次問に自動遷移します。")
     if flagged:
