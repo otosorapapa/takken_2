@@ -2165,12 +2165,22 @@ def render_stats(db: DBManager, df: pd.DataFrame) -> None:
     attempts["created_at"] = pd.to_datetime(attempts["created_at"])
     attempts["seconds"] = pd.to_numeric(attempts.get("seconds"), errors="coerce")
     attempts["confidence"] = pd.to_numeric(attempts.get("confidence"), errors="coerce")
+    question_meta_cols = ["id", "question", "category", "topic", "tags", "difficulty"]
     merged = attempts.merge(
-        df[["id", "question", "category", "topic", "tags", "difficulty"]],
+        df[question_meta_cols],
         left_on="question_id",
         right_on="id",
         how="left",
+        suffixes=("", "_question"),
     )
+    for col in ["category", "topic"]:
+        alt_col = f"{col}_question"
+        if alt_col in merged.columns:
+            if col in merged.columns:
+                merged[col] = merged[col].fillna(merged[alt_col])
+            else:
+                merged[col] = merged[alt_col]
+            merged = merged.drop(columns=[alt_col])
     accuracy = merged["is_correct"].mean()
     avg_seconds = merged["seconds"].mean()
     avg_confidence = merged["confidence"].mean()
