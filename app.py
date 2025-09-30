@@ -110,6 +110,28 @@ questions_table = Table(
     UniqueConstraint("year", "q_no", name="uq_questions_year_qno"),
 )
 
+predicted_questions_table = Table(
+    "predicted_questions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("label", String),
+    Column("year", String),
+    Column("q_no", String),
+    Column("category", String),
+    Column("topic", String),
+    Column("source", String),
+    Column("question", String, nullable=False),
+    Column("choice1", String, nullable=False),
+    Column("choice2", String, nullable=False),
+    Column("choice3", String, nullable=False),
+    Column("choice4", String, nullable=False),
+    Column("correct", Integer),
+    Column("explanation", String),
+    Column("difficulty", Integer, default=DIFFICULTY_DEFAULT),
+    Column("tags", String),
+    Column("created_at", DateTime, server_default=func.now()),
+)
+
 attempts_table = Table(
     "attempts",
     metadata,
@@ -394,6 +416,24 @@ ANSWER_TEMPLATE_COLUMNS = [
     "tags",
 ]
 
+PREDICTED_TEMPLATE_COLUMNS = [
+    "label",
+    "category",
+    "topic",
+    "source",
+    "question",
+    "choice1",
+    "choice2",
+    "choice3",
+    "choice4",
+    "correct",
+    "explanation",
+    "year",
+    "q_no",
+    "difficulty",
+    "tags",
+]
+
 
 @st.cache_data(show_spinner=False)
 def get_template_archive() -> bytes:
@@ -431,10 +471,33 @@ def get_template_archive() -> bytes:
         ],
         columns=ANSWER_TEMPLATE_COLUMNS,
     )
+    predicted_template = pd.DataFrame(
+        [
+            {
+                "label": "予想問題001",
+                "category": CATEGORY_CHOICES[0],
+                "topic": "直前対策",
+                "source": "講師予想",
+                "question": "ここに予想問題の本文を入力してください。",
+                "choice1": "選択肢1",
+                "choice2": "選択肢2",
+                "choice3": "選択肢3",
+                "choice4": "選択肢4",
+                "correct": 1,
+                "explanation": "根拠となる条文や理由を記載できます。",
+                "year": dt.datetime.now().year + 1,
+                "q_no": "予想1",
+                "difficulty": DIFFICULTY_DEFAULT,
+                "tags": "予想;重要論点",
+            }
+        ],
+        columns=PREDICTED_TEMPLATE_COLUMNS,
+    )
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("questions_template.csv", question_template.to_csv(index=False))
         zf.writestr("answers_template.csv", answer_template.to_csv(index=False))
+        zf.writestr("predicted_template.csv", predicted_template.to_csv(index=False))
         q_excel = io.BytesIO()
         with pd.ExcelWriter(q_excel, engine="openpyxl") as writer:
             question_template.to_excel(writer, index=False, sheet_name="questions")
@@ -443,8 +506,12 @@ def get_template_archive() -> bytes:
         with pd.ExcelWriter(a_excel, engine="openpyxl") as writer:
             answer_template.to_excel(writer, index=False, sheet_name="answers")
         zf.writestr("answers_template.xlsx", a_excel.getvalue())
+        p_excel = io.BytesIO()
+        with pd.ExcelWriter(p_excel, engine="openpyxl") as writer:
+            predicted_template.to_excel(writer, index=False, sheet_name="predicted")
+        zf.writestr("predicted_template.xlsx", p_excel.getvalue())
         description = (
-            "questions_template は設問データ、answers_template は正答データのサンプルです。\n"
+            "questions_template は設問データ、answers_template は正答データ、predicted_template は予想問題データのサンプルです。\n"
             "不要な行は削除し、ご自身のデータを入力してからアップロードしてください。"
         )
         zf.writestr("README.txt", description)
@@ -469,6 +536,9 @@ class DBManager:
         with self.engine.connect() as conn:
             df = pd.read_sql(select(table), conn)
         return df
+
+    def load_predicted_questions(self) -> pd.DataFrame:
+        return self.load_dataframe(predicted_questions_table)
 
     def upsert_questions(self, df: pd.DataFrame) -> Tuple[int, int]:
         records = df.to_dict(orient="records")
@@ -533,6 +603,37 @@ class DBManager:
                         existing_ids.add(rec_id)
                     if None not in year_qno:
                         existing_pairs[year_qno] = rec_id
+        return inserted, updated
+
+    def upsert_predicted_questions(self, df: pd.DataFrame) -> Tuple[int, int]:
+        records = df.to_dict(orient="records")
+        ids = [rec["id"] for rec in records if "id" in rec]
+        inserted = 0
+        updated = 0
+        with self.engine.begin() as conn:
+            existing_ids: Set[str] = set()
+            if ids:
+                existing_ids = set(
+                    conn.execute(
+                        select(predicted_questions_table.c.id).where(
+                            predicted_questions_table.c.id.in_(ids)
+                        )
+                    ).scalars()
+                )
+            for rec in records:
+                rec_id = rec.get("id")
+                if rec_id in existing_ids:
+                    conn.execute(
+                        update(predicted_questions_table)
+                        .where(predicted_questions_table.c.id == rec_id)
+                        .values(**{k: v for k, v in rec.items() if k != "id"})
+                    )
+                    updated += 1
+                else:
+                    conn.execute(sa_insert(predicted_questions_table).values(**rec))
+                    inserted += 1
+                    if rec_id:
+                        existing_ids.add(rec_id)
         return inserted, updated
 
     def fetch_question(self, question_id: str) -> Optional[pd.Series]:
@@ -786,6 +887,71 @@ def normalize_answers(df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None
     return df
 
 
+def generate_predicted_question_id(row: pd.Series) -> str:
+    base = f"predicted|{row.get('label', '')}|{str(row.get('question', ''))[:80]}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+
+
+def normalize_predicted_questions(
+    df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None
+) -> pd.DataFrame:
+    df = df.copy()
+    if mapping:
+        df = df.rename(columns=mapping)
+    required_cols = ["question", "choice1", "choice2", "choice3", "choice4"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"必要な列が不足しています: {col}")
+    for col in required_cols:
+        df[col] = df[col].fillna("").astype(str)
+    df["label"] = df.get("label", "").fillna("").astype(str)
+    df["category"] = df.get("category", "").fillna("").astype(str)
+    df["topic"] = df.get("topic", "").fillna("").astype(str)
+    df["source"] = df.get("source", "").fillna("").astype(str)
+    df["year"] = df.get("year", "").fillna("").astype(str)
+    df["q_no"] = df.get("q_no", "").fillna("").astype(str)
+    df["explanation"] = df.get("explanation", "").fillna("").astype(str)
+    df["difficulty"] = (
+        df.get("difficulty")
+        .fillna(DIFFICULTY_DEFAULT)
+        .replace("", DIFFICULTY_DEFAULT)
+        .astype(int)
+    )
+    df["tags"] = df.get("tags", "").fillna("").astype(str)
+    if "correct" in df.columns:
+        df["correct"] = (
+            pd.to_numeric(df["correct"], errors="coerce")
+            .where(lambda x: x.isin([1, 2, 3, 4]))
+            .astype("Int64")
+        )
+    else:
+        df["correct"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+    if "id" not in df.columns or df["id"].isna().any() or (df["id"].astype(str).str.strip() == "").any():
+        df["id"] = df.apply(generate_predicted_question_id, axis=1)
+    df["id"] = df["id"].astype(str)
+    df = df.drop_duplicates(subset=["id"])
+    columns = [
+        "id",
+        "label",
+        "year",
+        "q_no",
+        "category",
+        "topic",
+        "source",
+        "question",
+        "choice1",
+        "choice2",
+        "choice3",
+        "choice4",
+        "correct",
+        "explanation",
+        "difficulty",
+        "tags",
+    ]
+    df = df[columns]
+    return df
+
+
 def validate_question_records(df: pd.DataFrame) -> List[str]:
     errors: List[str] = []
     required_cols = [
@@ -859,6 +1025,32 @@ def validate_answer_records(df: pd.DataFrame) -> List[str]:
             for _, row in out_of_range.reset_index().head(5).iterrows()
         )
         errors.append(f"correct_number は1〜4の範囲で指定してください: {sample_rows}")
+    return errors
+
+
+def validate_predicted_records(df: pd.DataFrame) -> List[str]:
+    errors: List[str] = []
+    required_cols = ["question", "choice1", "choice2", "choice3", "choice4"]
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        errors.append(f"必須列が不足しています: {', '.join(missing)}")
+        return errors
+    working = df.reset_index(drop=True)
+    for row_number, row in enumerate(working.itertuples(index=False), start=2):
+        label = getattr(row, "label", "") or f"行{row_number}"
+        question_text = str(getattr(row, "question", "")).strip()
+        if not question_text:
+            errors.append(f"{label}: 問題文が空欄です。")
+        choices = [str(getattr(row, f"choice{i}", "")).strip() for i in range(1, 5)]
+        if any(choice == "" for choice in choices):
+            errors.append(f"{label}: 空欄の選択肢があります。")
+        non_empty = [c for c in choices if c]
+        if len(set(non_empty)) < len(non_empty):
+            errors.append(f"{label}: 選択肢が重複しています。")
+    if "id" in working.columns:
+        dup_ids = working[working["id"].notna() & working["id"].astype(str).str.strip().duplicated()]["id"].unique()
+        if dup_ids.size > 0:
+            errors.append(f"重複したIDが存在します: {', '.join(map(str, dup_ids[:5]))}")
     return errors
 
 
@@ -950,6 +1142,48 @@ def build_sample_answers_csv() -> str:
     ]
     buffer = io.StringIO()
     pd.DataFrame(sample_rows, columns=ANSWER_TEMPLATE_COLUMNS).to_csv(buffer, index=False)
+    return buffer.getvalue()
+
+
+def build_sample_predicted_csv() -> str:
+    sample_rows = [
+        {
+            "label": "予想問題001",
+            "category": "宅建業法",
+            "topic": "重要事項説明",
+            "source": "講師予想",
+            "question": "宅地建物取引業者が重要事項説明を行う際の留意点について正しいものはどれか。",
+            "choice1": "専任取引士以外でも宅建士証の提示があれば説明できる。",
+            "choice2": "重要事項説明書は電磁的方法で交付できる。",
+            "choice3": "35条書面は売主が直接説明する必要がある。",
+            "choice4": "買主の承諾があれば口頭説明のみでよい。",
+            "correct": 2,
+            "explanation": "重要事項説明書は一定要件の下で電磁的方法による交付が認められています。",
+            "year": dt.datetime.now().year + 1,
+            "q_no": "予想1",
+            "difficulty": 3,
+            "tags": "予想;重要事項説明",
+        },
+        {
+            "label": "予想問題002",
+            "category": "権利関係",
+            "topic": "借地借家法",
+            "source": "模試作成チーム",
+            "question": "定期借家契約に関する次の記述のうち、適切なものはどれか。",
+            "choice1": "書面で契約すれば期間満了前でも常に解約できる。",
+            "choice2": "更新を前提としない旨を口頭で合意すれば定期借家となる。",
+            "choice3": "公正証書等の書面で契約しなければ効力を生じない。",
+            "choice4": "定期借家契約では中途解約は一切認められない。",
+            "correct": 3,
+            "explanation": "定期借家契約は公正証書等の書面による契約が必要です。",
+            "year": dt.datetime.now().year + 1,
+            "q_no": "予想2",
+            "difficulty": 2,
+            "tags": "予想;借地借家法",
+        },
+    ]
+    buffer = io.StringIO()
+    pd.DataFrame(sample_rows, columns=PREDICTED_TEMPLATE_COLUMNS).to_csv(buffer, index=False)
     return buffer.getvalue()
 
 
@@ -1888,7 +2122,7 @@ def render_learning(db: DBManager, df: pd.DataFrame) -> None:
     if df.empty:
         st.warning("設問データがありません。『データ入出力』からアップロードしてください。")
         return
-    tabs = st.tabs(["本試験モード", "適応学習", "分野別ドリル", "年度別演習", "弱点克服モード"])
+    tabs = st.tabs(["本試験モード", "適応学習", "分野別ドリル", "年度別演習", "弱点克服モード", "予想問題演習"])
     with tabs[0]:
         render_full_exam_lane(db, df)
     with tabs[1]:
@@ -1899,6 +2133,8 @@ def render_learning(db: DBManager, df: pd.DataFrame) -> None:
         render_year_drill_lane(db, df)
     with tabs[4]:
         render_weakness_lane(db, df)
+    with tabs[5]:
+        render_predicted_lane(db)
 
 
 def render_full_exam_lane(db: DBManager, df: pd.DataFrame) -> None:
@@ -2247,6 +2483,115 @@ def render_weakness_lane(db: DBManager, df: pd.DataFrame) -> None:
     render_question_interaction(db, row, attempt_mode="weakness", key_prefix="weakness")
 
 
+def render_predicted_lane(db: DBManager) -> None:
+    st.subheader("予想問題演習")
+    predicted_df = db.load_predicted_questions()
+    if predicted_df.empty:
+        st.info("予想問題データが登録されていません。『データ入出力』タブからCSVを取り込んでください。")
+        return
+    st.caption("アップロードした予想問題を使って直前対策の演習を行います。正答が未設定の場合は自己採点となります。")
+    total_questions = len(predicted_df)
+    summary_cols = st.columns(3)
+    with summary_cols[0]:
+        st.metric("登録数", total_questions)
+    with summary_cols[1]:
+        available_correct = predicted_df["correct"].notna().sum()
+        st.metric("正答付き", int(available_correct))
+    with summary_cols[2]:
+        categories = predicted_df["category"].replace("", pd.NA).dropna().nunique()
+        st.metric("カテゴリ数", int(categories) if not pd.isna(categories) else 0)
+    with st.expander("予想問題一覧", expanded=False):
+        preview_cols = [col for col in ["label", "category", "topic", "source"] if col in predicted_df.columns]
+        if preview_cols:
+            st.dataframe(predicted_df[preview_cols + ["question"]].head(20))
+        else:
+            st.dataframe(predicted_df.head(20))
+        st.caption("20件まで表示しています。詳細はCSVを編集してご確認ください。")
+    max_questions = max(1, total_questions)
+    default_count = min(10, max_questions)
+    col1, col2 = st.columns(2)
+    with col1:
+        question_count = st.slider("出題数", 1, max_questions, default_count, key="predicted_question_count")
+    with col2:
+        order_option = st.radio("出題順", ["ランダム", "登録順"], key="predicted_order", horizontal=True)
+
+    def start_predicted_session() -> None:
+        if order_option == "ランダム":
+            selection = predicted_df.sample(question_count).reset_index(drop=True)
+        else:
+            selection = predicted_df.head(question_count).reset_index(drop=True)
+        st.session_state["predicted_session"] = {
+            "questions": selection.to_dict(orient="records"),
+            "index": 0,
+            "started_at": dt.datetime.now().isoformat(),
+            "run_id": hashlib.sha256(f"predicted|{time.time()}".encode("utf-8")).hexdigest()[:8],
+        }
+
+    st.button("予想問題を開始", key="predicted_start", type="primary", on_click=with_rerun(start_predicted_session))
+
+    session = st.session_state.get("predicted_session")
+    if not session:
+        return
+    questions = session.get("questions", [])
+    if not questions:
+        st.warning("セッションに問題がありません。再度開始してください。")
+        return
+    index = session.get("index", 0)
+    total = len(questions)
+    index = max(0, min(index, total - 1))
+    st.progress((index + 1) / total)
+
+    def set_index(new_index: int) -> None:
+        current = st.session_state.get("predicted_session", {})
+        current["index"] = new_index
+        st.session_state["predicted_session"] = current
+
+    row_series = pd.Series(questions[index])
+    navigation = QuestionNavigation(
+        has_prev=index > 0,
+        has_next=index < total - 1,
+        on_prev=with_rerun(set_index, max(0, index - 1)),
+        on_next=with_rerun(set_index, min(total - 1, index + 1)),
+        label=f"{index + 1}/{total} 問を学習中",
+    )
+    render_question_interaction(
+        db,
+        row_series,
+        attempt_mode="predicted",
+        key_prefix=f"predicted_{session.get('run_id', 'session')}",
+        navigation=navigation,
+        enable_srs=False,
+        log_attempts=False,
+    )
+    action_cols = st.columns([1, 1, 2])
+    with action_cols[0]:
+        disabled = index <= 0
+        st.button(
+            "前の問題",
+            use_container_width=True,
+            disabled=disabled,
+            on_click=with_rerun(set_index, max(0, index - 1)),
+            key="predicted_prev_button",
+        )
+    with action_cols[1]:
+        disabled = index >= total - 1
+        st.button(
+            "次の問題",
+            use_container_width=True,
+            disabled=disabled,
+            on_click=with_rerun(set_index, min(total - 1, index + 1)),
+            key="predicted_next_button",
+        )
+    with action_cols[2]:
+        st.caption(f"演習中 {index + 1}/{total} 問")
+    st.button(
+        "セッションを終了",
+        key="predicted_end_session",
+        type="secondary",
+        on_click=with_rerun(lambda: st.session_state.pop("predicted_session", None)),
+    )
+
+
 def render_exam_session_body(
     db: DBManager,
     df: pd.DataFrame,
@@ -2447,6 +2792,8 @@ def render_question_interaction(
     attempt_mode: str,
     key_prefix: str,
     navigation: Optional[QuestionNavigation] = None,
+    enable_srs: bool = True,
+    log_attempts: bool = True,
 ) -> None:
     inject_ui_styles()
     last_question_key = f"{key_prefix}_last_question"
@@ -2472,8 +2819,29 @@ def render_question_interaction(
         st.session_state[order_key] = base_order.copy()
     order = st.session_state.get(order_key, base_order)
     choice_labels = ["①", "②", "③", "④"]
-    st.markdown(f"### {row['year']}年 問{row['q_no']}")
-    st.markdown(f"**{row['category']} / {row['topic']}**")
+    label_value = str(row.get("label", "")).strip()
+    if label_value:
+        header = label_value
+    else:
+        year_display = format_year_value(row.get("year"))
+        q_no_display = format_qno_value(row.get("q_no"))
+        if year_display and q_no_display:
+            header = f"{year_display} 問{q_no_display}"
+        elif year_display:
+            header = year_display
+        elif q_no_display:
+            header = f"問{q_no_display}"
+        else:
+            header = "予想問題"
+    st.markdown(f"### {header}")
+    category_value = str(row.get("category", "") or "").strip()
+    topic_value = str(row.get("topic", "") or "").strip()
+    if category_value and topic_value:
+        st.markdown(f"**{category_value} / {topic_value}**")
+    elif category_value:
+        st.markdown(f"**{category_value}**")
+    elif topic_value:
+        st.markdown(f"**{topic_value}**")
     render_law_reference(row)
     st.markdown(row["question"], unsafe_allow_html=True)
     selected_choice = st.session_state.get(selected_key)
@@ -2545,12 +2913,15 @@ def render_question_interaction(
             "label": help_label,
             "key": f"{key_prefix}_help_{row['id']}",
         },
-        {
-            "id": "srs_reset",
-            "label": "SRSリセット",
-            "key": f"{key_prefix}_srs_reset_{row['id']}",
-        },
     ]
+    if enable_srs:
+        action_buttons.append(
+            {
+                "id": "srs_reset",
+                "label": "SRSリセット",
+                "key": f"{key_prefix}_srs_reset_{row['id']}",
+            }
+        )
     with st.container():
         st.markdown('<div class="takken-action-bar">', unsafe_allow_html=True)
         for action in action_buttons:
@@ -2577,7 +2948,7 @@ def render_question_interaction(
             elif action["id"] == "help" and clicked:
                 help_visible = not help_visible
                 st.session_state[help_state_key] = help_visible
-            elif action["id"] == "srs_reset" and clicked:
+            elif action["id"] == "srs_reset" and clicked and enable_srs:
                 db.upsert_srs(
                     row["id"],
                     {
@@ -2610,10 +2981,11 @@ def render_question_interaction(
                 correct_choice = int(correct_choice)
                 is_correct = (selected_choice + 1) == correct_choice
                 initial_ease = st.session_state["settings"].get("sm2_initial_ease", 2.5)
-                srs_row = db.fetch_srs(row["id"])
                 grade_value = confidence_to_grade(is_correct, confidence_value)
-                payload = sm2_update(srs_row, grade=grade_value, initial_ease=initial_ease)
-                db.upsert_srs(row["id"], payload)
+                if enable_srs:
+                    srs_row = db.fetch_srs(row["id"])
+                    payload = sm2_update(srs_row, grade=grade_value, initial_ease=initial_ease)
+                    db.upsert_srs(row["id"], payload)
                 log_offline_attempt(
                     {
                         "timestamp": dt.datetime.now().isoformat(),
@@ -2638,15 +3010,16 @@ def render_question_interaction(
                     "grade": grade_value,
                 }
                 feedback = st.session_state[feedback_key]
-                db.record_attempt(
-                    row["id"],
-                    selected_choice + 1,
-                    is_correct,
-                    seconds=0,
-                    mode=attempt_mode,
-                    confidence=confidence_value,
-                    grade=grade_value,
-                )
+                if log_attempts:
+                    db.record_attempt(
+                        row["id"],
+                        selected_choice + 1,
+                        is_correct,
+                        seconds=0,
+                        mode=attempt_mode,
+                        confidence=confidence_value,
+                        grade=grade_value,
+                    )
                 if (
                     auto_advance_enabled
                     and navigation is not None
@@ -2702,11 +3075,39 @@ def render_question_interaction(
     shortcut_map["e"] = explanation_label
     shortcut_map["f"] = flag_label
     shortcut_map["h"] = help_label
-    shortcut_map["r"] = "SRSリセット"
+    if enable_srs:
+        shortcut_map["r"] = "SRSリセット"
     if navigation:
         shortcut_map["n"] = nav_next_label
         shortcut_map["p"] = nav_prev_label
     register_keyboard_shortcuts(shortcut_map)
+
+
+def format_year_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return f"{int(text)}年"
+    return text
+
+
+def format_qno_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return str(int(text))
+    return text
+
 
 def format_question_label(df: pd.DataFrame, question_id: str) -> str:
     if df.empty:
@@ -3004,7 +3405,7 @@ def render_data_io(db: DBManager) -> None:
         mime="application/zip",
     )
     st.caption("設問・正答データのCSV/XLSXテンプレートが含まれます。必要に応じて編集してご利用ください。")
-    sample_cols = st.columns(2)
+    sample_cols = st.columns(3)
     with sample_cols[0]:
         st.download_button(
             "サンプル questions.csv",
@@ -3020,6 +3421,14 @@ def render_data_io(db: DBManager) -> None:
             file_name="sample_answers.csv",
             mime="text/csv",
             help="正答番号や解説の記入例です。コピーしてご利用ください。",
+        )
+    with sample_cols[2]:
+        st.download_button(
+            "サンプル predicted.csv",
+            data=build_sample_predicted_csv(),
+            file_name="sample_predicted.csv",
+            mime="text/csv",
+            help="予想問題の入力例です。ラベルや出典を記入して活用ください。",
         )
     st.caption("サンプルCSVはExcelに貼り付けて使えるよう列幅を調整済みです。コピー&ペーストで手早く登録できます。")
     st.markdown("### クイックインポート (questions.csv / answers.csv)")
@@ -3121,6 +3530,52 @@ def render_data_io(db: DBManager) -> None:
                                 st.caption("理由列を参考にCSVの該当行を修正してください。全件はrejects_*.csvでダウンロードできます。")
                         if not conflicts.empty:
                             st.info(f"正答の衝突が {len(conflicts)} 件あり、上書きしました。")
+
+    st.markdown("### 予想問題インポート (predicted.csv)")
+    predicted_file = st.file_uploader(
+        "predicted.csv をアップロード",
+        type=["csv"],
+        key="predicted_file_uploader",
+        help="予想問題データをCSV形式でアップロードします。選択肢や解説を含めたテンプレートに対応しています。",
+    )
+    if st.button("予想問題インポート実行", key="predicted_import_button"):
+        if predicted_file is None:
+            st.warning("predicted.csv を選択してください。")
+        else:
+            data = predicted_file.getvalue()
+            try:
+                predicted_df = pd.read_csv(io.BytesIO(data))
+            except UnicodeDecodeError:
+                predicted_df = pd.read_csv(io.BytesIO(data), encoding="cp932")
+            errors = validate_predicted_records(predicted_df)
+            if errors:
+                for err in errors:
+                    st.error(err)
+                st.info("テンプレートの列構成に合わせて再度アップロードしてください。")
+            else:
+                try:
+                    normalized_predicted = normalize_predicted_questions(predicted_df)
+                except Exception as exc:
+                    st.error(f"predicted.csv の整形に失敗しました: {exc}")
+                else:
+                    inserted, updated = db.upsert_predicted_questions(normalized_predicted)
+                    st.success(f"予想問題データを取り込みました。追加 {inserted} 件 / 更新 {updated} 件")
+                    st.session_state.pop("predicted_session", None)
+                    if not normalized_predicted.empty:
+                        st.dataframe(
+                            normalized_predicted.head(10)[
+                                [
+                                    "label",
+                                    "category",
+                                    "topic",
+                                    "source",
+                                    "question",
+                                    "correct",
+                                ]
+                            ],
+                            use_container_width=True,
+                        )
+                        st.caption("取り込んだ予想問題の先頭10件を表示しています。")
     st.markdown("### クイックエクスポート (questions.csv / answers.csv)")
     existing_questions = load_questions_df()
     if existing_questions.empty:
