@@ -302,13 +302,17 @@ def match_search_suggestions(dictionary: List[str], query: str, limit: int = 6) 
 
 
 def trigger_global_search() -> None:
-    query = str(st.session_state.get("global_search_input", "") or "").strip()
+    raw_value = st.session_state.get("global_search_input", "")
+    query = str(raw_value or "").strip()
+    st.session_state["global_search_input"] = raw_value
+    st.session_state["_global_search_input_widget"] = raw_value
     st.session_state["global_search_query"] = query
     st.session_state["global_search_submitted"] = bool(query)
 
 
 def clear_global_search() -> None:
     st.session_state["global_search_input"] = ""
+    st.session_state["_global_search_input_widget"] = ""
     st.session_state["global_search_query"] = ""
     st.session_state["global_search_submitted"] = False
     st.session_state.pop("global_search_pending", None)
@@ -324,6 +328,8 @@ def set_global_search_query(query: str) -> None:
         "query": normalized,
         "submitted": bool(normalized),
     }
+    st.session_state["global_search_input"] = normalized
+    st.session_state["_global_search_input_widget"] = normalized
     st.session_state["global_search_query"] = normalized
     st.session_state["global_search_submitted"] = bool(normalized)
 
@@ -333,6 +339,33 @@ def safe_rerun() -> None:
         st.rerun()
     except AttributeError:
         st.experimental_rerun()
+
+
+def with_rerun(callback: Callable[..., None], *args, **kwargs) -> Callable[[], None]:
+    def _inner() -> None:
+        callback(*args, **kwargs)
+        safe_rerun()
+
+    return _inner
+
+
+def handle_global_search_input_change() -> None:
+    st.session_state["global_search_input"] = st.session_state.get("_global_search_input_widget", "")
+    trigger_global_search()
+
+
+def handle_global_search_submit() -> None:
+    st.session_state["global_search_input"] = st.session_state.get("_global_search_input_widget", "")
+    trigger_global_search()
+
+
+def handle_global_search_clear() -> None:
+    request_clear_global_search()
+    clear_global_search()
+
+
+def handle_nav_change() -> None:
+    st.session_state["nav"] = st.session_state.get("_nav_widget", "ホーム")
 
 
 QUESTION_TEMPLATE_COLUMNS = [
@@ -1678,6 +1711,7 @@ def init_session_state() -> None:
         "global_search_submitted": False,
         "global_search_should_clear": False,
         "global_search_pending": None,
+        "_global_search_input_widget": "",
         "settings": {
             "shuffle_choices": True,
             "theme": "ライト",
@@ -1688,6 +1722,7 @@ def init_session_state() -> None:
             "review_low_confidence_threshold": 60,
             "review_elapsed_days": 7,
         },
+        "_nav_widget": "ホーム",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1707,6 +1742,7 @@ def main() -> None:
         st.session_state["global_search_input"] = query
         st.session_state["global_search_query"] = query
         st.session_state["global_search_submitted"] = submitted
+        st.session_state["_global_search_input_widget"] = query
     apply_user_preferences()
     engine = get_engine()
     db = DBManager(engine)
@@ -1716,21 +1752,27 @@ def main() -> None:
 
     sidebar = st.sidebar
     sidebar.title("宅建10年ドリル")
-    nav = sidebar.radio(
+    if st.session_state.get("_nav_widget") != st.session_state.get("nav"):
+        st.session_state["_nav_widget"] = st.session_state.get("nav", "ホーム")
+    sidebar.radio(
         "メニュー",
         ["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"],
         index=["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"].index(
             st.session_state.get("nav", "ホーム")
         ),
+        key="_nav_widget",
+        on_change=with_rerun(handle_nav_change),
     )
-    st.session_state["nav"] = nav
+    nav = st.session_state.get("nav", "ホーム")
     sidebar.divider()
+    if st.session_state.get("_global_search_input_widget") != st.session_state.get("global_search_input"):
+        st.session_state["_global_search_input_widget"] = st.session_state.get("global_search_input", "")
     sidebar.text_input(
         "🔍 横断検索",
-        key="global_search_input",
+        key="_global_search_input_widget",
         placeholder="抵当権 代価弁済 / 再建築不可 など",
         help="Enterキーまたは『検索』ボタンで実行します。",
-        on_change=trigger_global_search,
+        on_change=with_rerun(handle_global_search_input_change),
     )
     suggestion_container = sidebar.container()
     current_input = st.session_state.get("global_search_input", "")
@@ -1741,28 +1783,35 @@ def main() -> None:
             suggestion_cols = st.columns(2)
             for idx, keyword in enumerate(suggestions):
                 col = suggestion_cols[idx % 2]
-                if col.button(keyword, key=f"global_suggest_{idx}", type="secondary"):
-                    set_global_search_query(keyword)
-                    safe_rerun()
+                col.button(
+                    keyword,
+                    key=f"global_suggest_{idx}",
+                    type="secondary",
+                    on_click=with_rerun(set_global_search_query, keyword),
+                )
     search_action_cols = sidebar.columns(2)
-    if search_action_cols[0].button("検索", key="global_search_button"):
-        trigger_global_search()
-    if search_action_cols[1].button(
+    search_action_cols[0].button(
+        "検索",
+        key="global_search_button",
+        on_click=with_rerun(handle_global_search_submit),
+    )
+    search_action_cols[1].button(
         "条件クリア",
         key="global_search_clear",
         type="secondary",
-    ):
-        request_clear_global_search()
-        safe_rerun()
+        on_click=with_rerun(handle_global_search_clear),
+    )
     search_query = st.session_state.get("global_search_query", "")
     with sidebar.expander("キーワードヒント", expanded=False):
         st.caption("よく使う語句をクリックすると検索欄に自動入力されます。")
         hint_cols = st.columns(2)
         for idx, keyword in enumerate(GLOBAL_SEARCH_SUGGESTIONS):
-            if hint_cols[idx % 2].button(keyword, key=f"global_search_hint_{idx}"):
-                set_global_search_query(keyword)
-                search_query = keyword
-                safe_rerun()
+            hint_cols[idx % 2].button(
+                keyword,
+                key=f"global_search_hint_{idx}",
+                on_click=with_rerun(set_global_search_query, keyword),
+            )
+        search_query = st.session_state.get("global_search_query", "")
     with sidebar.expander("モード別の使い方ガイド", expanded=False):
         st.markdown(
             "\n".join(
@@ -1845,26 +1894,33 @@ def render_full_exam_lane(db: DBManager, df: pd.DataFrame) -> None:
         st.info("50問の出題には最低50問のデータが必要です。データを追加してください。")
         return
     session: Optional[ExamSession] = st.session_state.get("exam_session")
+    error_key = "_full_exam_error"
+    error_message = st.session_state.pop(error_key, None)
+    if error_message:
+        st.warning(error_message)
+
+    def start_full_exam_session() -> None:
+        questions = stratified_exam(df)
+        if not questions:
+            st.session_state[error_key] = "出題可能な問題が不足しています。データを確認してください。"
+            return
+        st.session_state.pop("exam_result_本試験モード", None)
+        st.session_state["exam_session"] = ExamSession(
+            id=None,
+            name=f"本試験モード {dt.datetime.now():%Y%m%d-%H%M}",
+            questions=questions,
+            started_at=dt.datetime.now(),
+            year_mode="層化ランダム50",
+            mode="本試験モード",
+        )
+
     if session is None or session.mode != "本試験モード":
-        if st.button(
+        st.button(
             "50問模試を開始",
             key="start_full_exam",
             help="本試験と同じ50問・120分構成で一気に演習します。結果は統計に反映されます。",
-        ):
-            questions = stratified_exam(df)
-            if not questions:
-                st.warning("出題可能な問題が不足しています。")
-                return
-            st.session_state.pop("exam_result_本試験モード", None)
-            st.session_state["exam_session"] = ExamSession(
-                id=None,
-                name=f"本試験モード {dt.datetime.now():%Y%m%d-%H%M}",
-                questions=questions,
-                started_at=dt.datetime.now(),
-                year_mode="層化ランダム50",
-                mode="本試験モード",
-            )
-            session = st.session_state.get("exam_session")
+            on_click=with_rerun(start_full_exam_session),
+        )
     session = st.session_state.get("exam_session")
     if session and session.mode == "本試験モード":
         render_exam_session_body(db, df, session, key_prefix="main_exam")
@@ -1922,14 +1978,19 @@ def render_subject_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
             help="代表的な絞り込み条件をワンクリックで適用できます。",
             key="subject_preset",
         )
-        if st.button("プリセットを適用", key="subject_apply_preset"):
+        def apply_subject_preset() -> None:
             config = SUBJECT_PRESETS[preset]
             st.session_state["subject_categories"] = config["categories"]
             st.session_state["subject_difficulty"] = config["difficulty"]
             st.session_state["subject_review_only"] = config["review_only"]
             st.session_state["subject_topics"] = config.get("topics", [])
             st.session_state["subject_keyword"] = ""
-            safe_rerun()
+
+        st.button(
+            "プリセットを適用",
+            key="subject_apply_preset",
+            on_click=with_rerun(apply_subject_preset),
+        )
         categories = st.multiselect(
             "分野",
             CATEGORY_CHOICES,
