@@ -6,12 +6,13 @@ import random
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit.components.v1 import html
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -27,6 +28,7 @@ DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "takken.db"
 UPLOAD_DIR = DATA_DIR / "uploads"
 REJECT_DIR = DATA_DIR / "rejects"
+OFFLINE_EXPORT_DIR = DATA_DIR / "offline_exports"
 MAPPING_KIND_QUESTIONS = "questions"
 MAPPING_KIND_ANSWERS = "answers"
 DEFAULT_CATEGORY_MAP = {
@@ -136,6 +138,7 @@ def ensure_directories() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     UPLOAD_DIR.mkdir(exist_ok=True)
     REJECT_DIR.mkdir(exist_ok=True)
+    OFFLINE_EXPORT_DIR.mkdir(exist_ok=True)
 
 
 QUESTION_TEMPLATE_COLUMNS = [
@@ -297,6 +300,16 @@ class DBManager:
                     exam_id=exam_id,
                 )
             )
+
+    def fetch_srs(self, question_id: str) -> Optional[pd.Series]:
+        with self.engine.connect() as conn:
+            df = pd.read_sql(
+                select(srs_table).where(srs_table.c.question_id == question_id),
+                conn,
+            )
+        if df.empty:
+            return None
+        return df.iloc[0]
 
     def log_exam_result(self, payload: Dict[str, object]) -> Optional[int]:
         with self.engine.begin() as conn:
@@ -620,6 +633,15 @@ class ExamSession:
     mode: str
 
 
+@dataclass
+class QuestionNavigation:
+    has_prev: bool = False
+    has_next: bool = False
+    on_prev: Optional[Callable[[], None]] = None
+    on_next: Optional[Callable[[], None]] = None
+    label: Optional[str] = None
+
+
 def select_random_questions(df: pd.DataFrame, count: int) -> List[str]:
     if df.empty:
         return []
@@ -641,12 +663,12 @@ def stratified_exam(df: pd.DataFrame) -> List[str]:
     return selected
 
 
-def sm2_update(row: Optional[pd.Series], grade: int) -> Dict[str, object]:
+def sm2_update(row: Optional[pd.Series], grade: int, initial_ease: float = 2.5) -> Dict[str, object]:
     today = dt.date.today()
     if row is None:
         repetition = 0
         interval = 1
-        ease = 2.5
+        ease = initial_ease
     else:
         repetition = row.get("repetition", 0) or 0
         interval = row.get("interval", 1) or 1
@@ -675,6 +697,153 @@ def sm2_update(row: Optional[pd.Series], grade: int) -> Dict[str, object]:
     }
 
 
+def inject_ui_styles() -> None:
+    if st.session_state.get("_ui_styles_injected"):
+        return
+    st.markdown(
+        """
+        <style>
+        .takken-choice-button button {
+            width: 100%;
+            min-height: 56px;
+            font-size: 1.05rem;
+            border-radius: 0.8rem;
+        }
+        .takken-choice-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 0.5rem;
+        }
+        @media (max-width: 768px) {
+            .takken-choice-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .takken-inline-actions button {
+            min-height: 48px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.session_state["_ui_styles_injected"] = True
+
+
+def confidence_to_grade(is_correct: bool, confidence: int) -> int:
+    confidence = max(0, min(100, confidence))
+    if is_correct:
+        if confidence >= 90:
+            return 5
+        if confidence >= 70:
+            return 4
+        if confidence >= 50:
+            return 3
+        return 2
+    if confidence >= 70:
+        return 1
+    return 0
+
+
+def get_offline_attempts_df() -> pd.DataFrame:
+    records = st.session_state.get("offline_attempts", [])
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records)
+
+
+def persist_offline_attempts(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    OFFLINE_EXPORT_DIR.mkdir(exist_ok=True)
+    csv_path = OFFLINE_EXPORT_DIR / "attempts_latest.csv"
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    parquet_path = OFFLINE_EXPORT_DIR / "attempts_latest.parquet"
+    try:
+        df.to_parquet(parquet_path, index=False)
+        st.session_state["_offline_parquet_error"] = None
+    except Exception as exc:
+        st.session_state["_offline_parquet_error"] = str(exc)
+        if parquet_path.exists():
+            parquet_path.unlink()
+
+
+def log_offline_attempt(entry: Dict[str, object]) -> None:
+    attempts = st.session_state.setdefault("offline_attempts", [])
+    attempts.append(entry)
+    df = get_offline_attempts_df()
+    persist_offline_attempts(df)
+
+
+def render_offline_downloads(key_prefix: str) -> None:
+    df = get_offline_attempts_df()
+    if df.empty:
+        return
+    with st.expander("学習結果ダウンロード", expanded=False):
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+        st.download_button(
+            "CSVをダウンロード",
+            data=csv_buffer.getvalue(),
+            file_name="takken_learning_log.csv",
+            mime="text/csv",
+            key=f"{key_prefix}_csv",
+        )
+        parquet_buffer = io.BytesIO()
+        parquet_error = st.session_state.get("_offline_parquet_error")
+        if parquet_error:
+            st.warning(f"Parquetの自動保存に失敗しました: {parquet_error}")
+        try:
+            parquet_buffer.seek(0)
+            df.to_parquet(parquet_buffer, index=False)
+            st.download_button(
+                "Parquetをダウンロード",
+                data=parquet_buffer.getvalue(),
+                file_name="takken_learning_log.parquet",
+                mime="application/octet-stream",
+                key=f"{key_prefix}_parquet",
+            )
+        except Exception as exc:
+            st.warning(f"Parquetのダウンロード生成に失敗しました: {exc}")
+        st.caption(f"ファイルは {OFFLINE_EXPORT_DIR.as_posix()} にも自動保存されます。")
+
+
+def register_keyboard_shortcuts(mapping: Dict[str, str]) -> None:
+    if not mapping:
+        return
+    html(
+        """
+        <script>
+        (function() {
+            const mapping = %s;
+            document.addEventListener('keydown', function(event) {
+                const active = document.activeElement;
+                if (active && ['input', 'textarea', 'select'].includes(active.tagName.toLowerCase())) {
+                    return;
+                }
+                const key = event.key ? event.key.toLowerCase() : '';
+                const label = mapping[key];
+                if (!label) {
+                    return;
+                }
+                const doc = window.parent ? window.parent.document : document;
+                const buttons = doc.querySelectorAll('button');
+                for (const btn of buttons) {
+                    if (!btn.innerText) {
+                        continue;
+                    }
+                    if (btn.innerText.trim().startsWith(label.trim())) {
+                        event.preventDefault();
+                        btn.click();
+                        break;
+                    }
+                }
+            }, true);
+        })();
+        </script>
+        """ % json.dumps({k.lower(): v for k, v in mapping.items()}, ensure_ascii=False),
+        height=0,
+    )
 def decode_uploaded_file(file: "UploadedFile") -> List[Tuple[str, pd.DataFrame]]:
     filename = file.name
     suffix = Path(filename).suffix.lower()
@@ -915,15 +1084,27 @@ def render_year_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
     index = max(0, min(index, total - 1))
     current_row = subset.iloc[index]
     st.progress((index + 1) / total)
-    st.caption(f"{index + 1}/{total} 問を学習中")
-    render_question_interaction(db, current_row, attempt_mode="year_drill", key_prefix="year")
-    col_prev, col_next = st.columns(2)
-    with col_prev:
-        if st.button("前の問題", disabled=index == 0, key="year_prev"):
-            st.session_state[progress_key] = max(0, index - 1)
-    with col_next:
-        if st.button("次の問題", disabled=index >= total - 1, key="year_next"):
-            st.session_state[progress_key] = min(total - 1, index + 1)
+
+    def go_prev() -> None:
+        st.session_state[progress_key] = max(0, index - 1)
+
+    def go_next() -> None:
+        st.session_state[progress_key] = min(total - 1, index + 1)
+
+    navigation = QuestionNavigation(
+        has_prev=index > 0,
+        has_next=index < total - 1,
+        on_prev=go_prev,
+        on_next=go_next,
+        label=f"{index + 1}/{total} 問を学習中",
+    )
+    render_question_interaction(
+        db,
+        current_row,
+        attempt_mode="year_drill",
+        key_prefix="year",
+        navigation=navigation,
+    )
 
 
 def render_weakness_lane(db: DBManager, df: pd.DataFrame) -> None:
@@ -1184,57 +1365,220 @@ def render_question_interaction(
     row: pd.Series,
     attempt_mode: str,
     key_prefix: str,
+    navigation: Optional[QuestionNavigation] = None,
 ) -> None:
+    inject_ui_styles()
     last_question_key = f"{key_prefix}_last_question"
     feedback_key = f"{key_prefix}_feedback"
+    selected_key = f"{key_prefix}_selected_{row['id']}"
+    order_key = f"{key_prefix}_order_{row['id']}"
+    explanation_key = f"{key_prefix}_explanation_{row['id']}"
+    confidence_key = f"{key_prefix}_confidence_{row['id']}"
+    help_state_key = f"{key_prefix}_help_visible"
     if st.session_state.get(last_question_key) != row["id"]:
         st.session_state[last_question_key] = row["id"]
         st.session_state.pop(feedback_key, None)
+        st.session_state[selected_key] = None
+        st.session_state[confidence_key] = 50
+        st.session_state[order_key] = None
+        st.session_state[explanation_key] = False
+    choices = [row.get(f"choice{i}", "") for i in range(1, 5)]
+    base_order = list(range(4))
+    if st.session_state["settings"].get("shuffle_choices", True):
+        random.seed(f"{row['id']}_{attempt_mode}")
+        random.shuffle(base_order)
+    if st.session_state.get(order_key) is None:
+        st.session_state[order_key] = base_order.copy()
+    order = st.session_state.get(order_key, base_order)
+    choice_labels = ["①", "②", "③", "④"]
     st.markdown(f"### {row['year']}年 問{row['q_no']}")
     st.markdown(f"**{row['category']} / {row['topic']}**")
     render_law_reference(row)
     st.markdown(row["question"], unsafe_allow_html=True)
-    choices = [row.get(f"choice{i}", "") for i in range(1, 5)]
-    order = list(range(4))
-    if st.session_state["settings"].get("shuffle_choices", True):
-        random.seed(f"{row['id']}_{attempt_mode}")
-        random.shuffle(order)
-    choice_labels = ["①", "②", "③", "④"]
-    selected = st.radio(
-        "解答を選択",
-        order,
-        format_func=lambda idx: f"{choice_labels[idx]} {choices[idx]}",
-        key=f"{key_prefix}_answer_{row['id']}",
-        index=None,
+    selected_choice = st.session_state.get(selected_key)
+    button_labels: List[str] = []
+    for idx in range(0, len(order), 2):
+        cols = st.columns(2)
+        for col_idx in range(2):
+            pos = idx + col_idx
+            if pos >= len(order):
+                continue
+            actual_idx = order[pos]
+            label_text = choices[actual_idx]
+            display_label = f"{choice_labels[actual_idx]} {label_text}".strip()
+            button_labels.append(display_label or choice_labels[actual_idx])
+            button_key = f"{key_prefix}_choice_{row['id']}_{actual_idx}"
+            button_type = "primary" if selected_choice == actual_idx else "secondary"
+            with cols[col_idx]:
+                st.markdown('<div class="takken-choice-button">', unsafe_allow_html=True)
+                if st.button(
+                    display_label or choice_labels[actual_idx],
+                    key=button_key,
+                    use_container_width=True,
+                    type=button_type,
+                ):
+                    st.session_state[selected_key] = actual_idx
+                    selected_choice = actual_idx
+                st.markdown("</div>", unsafe_allow_html=True)
+    st.caption("1〜4キーで選択肢を即答できます。E:解説 F:フラグ N/P:移動 H:ヘルプ")
+    confidence_value = st.session_state.get(confidence_key, 50)
+    confidence_value = st.slider(
+        "確信度（ぜんぜん自信なし ↔ 完璧）",
+        0,
+        100,
+        value=confidence_value,
+        key=confidence_key,
     )
-    if st.button("採点", key=f"{key_prefix}_grade_{row['id']}"):
-        correct_choice = row.get("correct")
-        if pd.isna(correct_choice):
-            st.warning("正答が未登録の問題です。解答データを取り込んでください。")
+    st.session_state[confidence_key] = confidence_value
+    show_explanation = st.session_state.get(explanation_key, False)
+    flagged = row["id"] in set(st.session_state.get("review_flags", []))
+    grade_label = "採点"
+    explanation_label = "解説を隠す" if show_explanation else "解説を表示"
+    flag_label = "フラグ解除" if flagged else "復習フラグ"
+    help_label = "ヘルプ"
+    action_cols = st.columns(4)
+    with action_cols[0]:
+        grade_clicked = st.button(
+            grade_label,
+            key=f"{key_prefix}_grade_{row['id']}",
+            use_container_width=True,
+            type="primary",
+        )
+    with action_cols[1]:
+        if st.button(
+            explanation_label,
+            key=f"{key_prefix}_toggle_explanation_{row['id']}",
+            use_container_width=True,
+        ):
+            show_explanation = not show_explanation
+            st.session_state[explanation_key] = show_explanation
+    with action_cols[2]:
+        if st.button(
+            flag_label,
+            key=f"{key_prefix}_flag_{row['id']}",
+            use_container_width=True,
+        ):
+            flags = set(st.session_state.get("review_flags", []))
+            if flagged:
+                flags.discard(row["id"])
+            else:
+                flags.add(row["id"])
+            st.session_state["review_flags"] = list(flags)
+            flagged = row["id"] in flags
+    with action_cols[3]:
+        help_visible = st.session_state.get(help_state_key, False)
+        if st.button(
+            help_label,
+            key=f"{key_prefix}_help_{row['id']}",
+            use_container_width=True,
+        ):
+            help_visible = not help_visible
+            st.session_state[help_state_key] = help_visible
         else:
-            correct_choice = int(correct_choice)
-            is_correct = (selected + 1) == correct_choice
-            db.record_attempt(row["id"], selected + 1, is_correct, seconds=0, mode=attempt_mode)
-            st.session_state[feedback_key] = {
-                "is_correct": is_correct,
-                "correct_choice": correct_choice,
-                "question_id": row["id"],
-            }
+            help_visible = st.session_state.get(help_state_key, False)
+    if flagged:
+        st.caption("この問題は復習フラグが設定されています。")
     feedback = st.session_state.get(feedback_key)
+    if grade_clicked:
+        if selected_choice is None:
+            st.warning("選択肢を選んでから採点してください。")
+        else:
+            correct_choice = row.get("correct")
+            if pd.isna(correct_choice):
+                st.warning("正答が未登録の問題です。解答データを取り込んでください。")
+            else:
+                correct_choice = int(correct_choice)
+                is_correct = (selected_choice + 1) == correct_choice
+                db.record_attempt(
+                    row["id"],
+                    selected_choice + 1,
+                    is_correct,
+                    seconds=0,
+                    mode=attempt_mode,
+                )
+                initial_ease = st.session_state["settings"].get("sm2_initial_ease", 2.5)
+                srs_row = db.fetch_srs(row["id"])
+                grade_value = confidence_to_grade(is_correct, confidence_value)
+                payload = sm2_update(srs_row, grade=grade_value, initial_ease=initial_ease)
+                db.upsert_srs(row["id"], payload)
+                log_offline_attempt(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(),
+                        "question_id": row["id"],
+                        "year": row.get("year"),
+                        "q_no": row.get("q_no"),
+                        "category": row.get("category"),
+                        "topic": row.get("topic"),
+                        "selected": selected_choice + 1,
+                        "correct": correct_choice,
+                        "is_correct": is_correct,
+                        "mode": attempt_mode,
+                        "confidence": confidence_value,
+                        "srs_grade": grade_value,
+                    }
+                )
+                st.session_state[feedback_key] = {
+                    "is_correct": is_correct,
+                    "correct_choice": correct_choice,
+                    "question_id": row["id"],
+                    "confidence": confidence_value,
+                    "grade": grade_value,
+                }
+                feedback = st.session_state[feedback_key]
     if feedback and feedback.get("question_id") == row["id"]:
-        message = "正解です！" if feedback["is_correct"] else f"不正解。正答は {choice_labels[feedback['correct_choice'] - 1]}"
+        correct_msg = choice_labels[feedback["correct_choice"] - 1]
+        message = "正解です！" if feedback["is_correct"] else f"不正解。正答は {correct_msg}"
         (st.success if feedback["is_correct"] else st.error)(message)
+        st.caption(
+            f"確信度 {feedback.get('confidence', confidence_value)}% → 復習グレード {feedback.get('grade', '')}"
+        )
+    if show_explanation:
         st.markdown("#### 解説")
         st.write(row.get("explanation", "解説が未登録です。"))
         similar = compute_similarity(row["id"])
         if not similar.empty:
             st.markdown("#### 類似問題")
             st.dataframe(similar)
-        if st.button("要復習に追加", key=f"{key_prefix}_srs_{row['id']}"):
-            srs_row = fetch_srs_row(db, row["id"])
-            payload = sm2_update(srs_row, grade=2)
-            db.upsert_srs(row["id"], payload)
-            st.toast("SRSに追加しました", icon="✅")
+    if help_visible:
+        st.info(
+            """ショートカット一覧\n- 1〜4: 選択肢を選ぶ\n- E: 解説の表示/非表示\n- F: 復習フラグの切り替え\n- N/P: 次へ・前へ\n- H: このヘルプ"""
+        )
+    nav_prev_label = "前へ"
+    nav_next_label = "次へ"
+    if navigation:
+        nav_cols = st.columns([1, 1, 2])
+        prev_kwargs = {
+            "use_container_width": True,
+            "disabled": not navigation.has_prev,
+            "key": f"{key_prefix}_prev_{row['id']}",
+        }
+        next_kwargs = {
+            "use_container_width": True,
+            "disabled": not navigation.has_next,
+            "key": f"{key_prefix}_next_{row['id']}",
+        }
+        if navigation.on_prev:
+            prev_kwargs["on_click"] = navigation.on_prev
+        if navigation.on_next:
+            next_kwargs["on_click"] = navigation.on_next
+        with nav_cols[0]:
+            st.button(nav_prev_label, **prev_kwargs)
+        with nav_cols[1]:
+            st.button(nav_next_label, **next_kwargs)
+        with nav_cols[2]:
+            if navigation.label:
+                st.caption(navigation.label)
+    render_offline_downloads(f"{key_prefix}_{row['id']}")
+    shortcut_map: Dict[str, str] = {}
+    for idx, label in enumerate(button_labels[:4]):
+        shortcut_map[str(idx + 1)] = label
+    shortcut_map["e"] = explanation_label
+    shortcut_map["f"] = flag_label
+    shortcut_map["h"] = help_label
+    if navigation:
+        shortcut_map["n"] = nav_next_label
+        shortcut_map["p"] = nav_prev_label
+    register_keyboard_shortcuts(shortcut_map)
 
 def format_question_label(df: pd.DataFrame, question_id: str) -> str:
     row = df[df["id"] == question_id].iloc[0]
@@ -1249,17 +1593,6 @@ def render_law_reference(row: pd.Series) -> None:
         st.caption(f"{LAW_BASELINE_LABEL} ｜ [条文検索]({url})")
     else:
         st.caption(LAW_BASELINE_LABEL)
-
-
-def fetch_srs_row(db: DBManager, question_id: str) -> Optional[pd.Series]:
-    with db.engine.connect() as conn:
-        df = pd.read_sql(
-            select(srs_table).where(srs_table.c.question_id == question_id),
-            conn,
-        )
-    if df.empty:
-        return None
-    return df.iloc[0]
 
 
 def render_mock_exam(db: DBManager) -> None:
@@ -1310,7 +1643,8 @@ def render_srs(db: DBManager) -> None:
         st.write(f"分野: {row['category']} / 期限: {row['due_date']}")
         grade = st.slider(f"評価 ({row['question_id']})", 0, 5, 3)
         if st.button("評価を保存", key=f"srs_save_{row['question_id']}"):
-            payload = sm2_update(row, grade)
+            initial_ease = st.session_state["settings"].get("sm2_initial_ease", 2.5)
+            payload = sm2_update(row, grade, initial_ease=initial_ease)
             db.upsert_srs(row["question_id"], payload)
             st.success("SRSを更新しました")
 
