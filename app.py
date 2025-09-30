@@ -236,7 +236,19 @@ def inject_style(css: str, style_id: str) -> None:
 def ensure_schema_migrations(engine: Engine) -> None:
     inspector = inspect(engine)
     with engine.begin() as conn:
-        attempt_columns = {col["name"] for col in inspector.get_columns("attempts")}
+        existing_tables = set(inspector.get_table_names())
+        for table in metadata.sorted_tables:
+            if table.name not in existing_tables:
+                table.create(conn)
+                existing_tables.add(table.name)
+
+        if attempts_table.name not in existing_tables:
+            attempts_table.create(conn)
+            existing_tables.add(attempts_table.name)
+
+        conn_inspector = inspect(conn)
+        attempt_columns = {col["name"] for col in conn_inspector.get_columns("attempts")}
+
         if "confidence" not in attempt_columns:
             conn.execute(text("ALTER TABLE attempts ADD COLUMN confidence INTEGER"))
         if "grade" not in attempt_columns:
