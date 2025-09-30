@@ -311,6 +311,19 @@ def apply_user_preferences() -> None:
     background-color: rgba(255, 255, 255, 0.04);
 }
 """
+    elif theme == "セピア":
+        theme_css = """
+[data-testid="stAppViewContainer"] {
+    background-color: #f3e9d2;
+    color: #4a3f35;
+}
+[data-testid="stSidebar"] {
+    background-color: #f9f1e0;
+}
+.stMetric, .stAlert {
+    background-color: rgba(74, 63, 53, 0.06);
+}
+"""
     else:
         theme_css = """
 [data-testid="stAppViewContainer"] {
@@ -4460,11 +4473,14 @@ def render_settings() -> None:
     st.title("設定")
     settings = st.session_state["settings"]
     st.info("学習体験を自分好みにカスタマイズできます。各項目の説明を参考に調整してください。")
+    theme_options = ["ライト", "ダーク", "セピア"]
+    current_theme = settings.get("theme", "ライト")
+    theme_index = theme_options.index(current_theme) if current_theme in theme_options else 0
     settings["theme"] = st.selectbox(
         "テーマ",
-        ["ライト", "ダーク"],
-        index=0 if settings.get("theme") == "ライト" else 1,
-        help="画面の配色を切り替えます。暗い環境ではダークテーマがおすすめです。",
+        theme_options,
+        index=theme_index,
+        help="画面の配色を切り替えます。暗い環境ではダークテーマ、長文読解にはセピアテーマがおすすめです。",
     )
     size_options = list(FONT_SIZE_SCALE.keys())
     default_size = settings.get("font_size", "標準")
