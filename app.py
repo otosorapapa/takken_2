@@ -900,12 +900,19 @@ def render_mock_exam(db: DBManager) -> None:
             continue
         row = row.iloc[0]
         st.markdown(f"### {row['year']}年 問{row['q_no']}")
-        st.write(row["question"])
+        st.markdown(row["question"], unsafe_allow_html=True)
+        choices = [row.get(f"choice{i}", "") for i in range(1, 5)]
+        choice_labels = ["①", "②", "③", "④"]
+        option_text = {
+            idx + 1: f"{choice_labels[idx]} {choices[idx]}" if choices[idx] else choice_labels[idx]
+            for idx in range(4)
+        }
         choice = st.radio(
             f"回答: {qid}",
             list(range(1, 5)),
             key=f"exam_{qid}",
             horizontal=True,
+            format_func=lambda opt: option_text.get(opt, str(opt)),
         )
         responses[qid] = choice
         if row.get("correct") == choice:
