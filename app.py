@@ -135,6 +135,90 @@ def ensure_directories() -> None:
     REJECT_DIR.mkdir(exist_ok=True)
 
 
+QUESTION_TEMPLATE_COLUMNS = [
+    "year",
+    "q_no",
+    "category",
+    "topic",
+    "question",
+    "choice1",
+    "choice2",
+    "choice3",
+    "choice4",
+    "explanation",
+    "difficulty",
+    "tags",
+]
+
+ANSWER_TEMPLATE_COLUMNS = [
+    "year",
+    "q_no",
+    "correct_number",
+    "correct_label",
+    "correct_text",
+    "explanation",
+    "difficulty",
+    "tags",
+]
+
+
+@st.cache_data(show_spinner=False)
+def get_template_archive() -> bytes:
+    question_template = pd.DataFrame(
+        [
+            {
+                "year": dt.datetime.now().year,
+                "q_no": 1,
+                "category": CATEGORY_CHOICES[0],
+                "topic": "小分類の例",
+                "question": "ここに問題文を入力してください。",
+                "choice1": "選択肢1",
+                "choice2": "選択肢2",
+                "choice3": "選択肢3",
+                "choice4": "選択肢4",
+                "explanation": "解説を入力できます。",
+                "difficulty": DIFFICULTY_DEFAULT,
+                "tags": "タグ1;タグ2",
+            }
+        ],
+        columns=QUESTION_TEMPLATE_COLUMNS,
+    )
+    answer_template = pd.DataFrame(
+        [
+            {
+                "year": dt.datetime.now().year,
+                "q_no": 1,
+                "correct_number": 1,
+                "correct_label": "A",
+                "correct_text": "選択肢1",
+                "explanation": "正答の解説を入力できます。",
+                "difficulty": DIFFICULTY_DEFAULT,
+                "tags": "タグ1;タグ2",
+            }
+        ],
+        columns=ANSWER_TEMPLATE_COLUMNS,
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("questions_template.csv", question_template.to_csv(index=False))
+        zf.writestr("answers_template.csv", answer_template.to_csv(index=False))
+        q_excel = io.BytesIO()
+        with pd.ExcelWriter(q_excel, engine="openpyxl") as writer:
+            question_template.to_excel(writer, index=False, sheet_name="questions")
+        zf.writestr("questions_template.xlsx", q_excel.getvalue())
+        a_excel = io.BytesIO()
+        with pd.ExcelWriter(a_excel, engine="openpyxl") as writer:
+            answer_template.to_excel(writer, index=False, sheet_name="answers")
+        zf.writestr("answers_template.xlsx", a_excel.getvalue())
+        description = (
+            "questions_template は設問データ、answers_template は正答データのサンプルです。\n"
+            "不要な行は削除し、ご自身のデータを入力してからアップロードしてください。"
+        )
+        zf.writestr("README.txt", description)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 @st.cache_resource
 def get_engine() -> Engine:
     ensure_directories()
@@ -876,13 +960,21 @@ def altair_chart(df: pd.DataFrame, x: str, y: str, title: str, mark: str = "line
 
 def render_data_io(db: DBManager) -> None:
     st.title("データ入出力")
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    st.markdown("### テンプレートファイル")
+    st.download_button(
+        "テンプレートをダウンロード (ZIP)",
+        data=get_template_archive(),
+        file_name=f"takken_templates_{timestamp}.zip",
+        mime="application/zip",
+    )
+    st.caption("設問・正答データのCSV/XLSXテンプレートが含まれます。必要に応じて編集してご利用ください。")
     st.markdown("### (1) ファイル選択")
     uploaded_files = st.file_uploader(
         "設問・解答ファイルを選択 (CSV/XLSX/ZIP)",
         type=["csv", "xlsx", "xls", "zip"],
         accept_multiple_files=True,
     )
-    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     datasets = []
     if uploaded_files:
         for file in uploaded_files:
