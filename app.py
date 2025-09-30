@@ -58,6 +58,13 @@ GLOBAL_SEARCH_SUGGESTIONS = [
     "瑕疵担保",
 ]
 
+FONT_SIZE_SCALE = {
+    "やや小さい": 0.95,
+    "標準": 1.0,
+    "やや大きい": 1.1,
+    "大きい": 1.2,
+}
+
 SUBJECT_PRESETS = {
     "バランスよく10問": {
         "categories": CATEGORY_CHOICES,
@@ -184,6 +191,92 @@ def ensure_schema_migrations(engine: Engine) -> None:
             conn.execute(text("ALTER TABLE attempts ADD COLUMN confidence INTEGER"))
         if "grade" not in attempt_columns:
             conn.execute(text("ALTER TABLE attempts ADD COLUMN grade INTEGER"))
+
+
+def apply_user_preferences() -> None:
+    settings = st.session_state.get("settings", {})
+    theme = settings.get("theme", "ライト")
+    font_label = settings.get("font_size", "標準")
+    scale = FONT_SIZE_SCALE.get(font_label, 1.0)
+    base_css = f"""
+    <style>
+    :root {{
+        --takken-font-scale: {scale};
+    }}
+    [data-testid="stAppViewContainer"] * {{
+        font-size: calc(1rem * var(--takken-font-scale));
+    }}
+    .takken-search-suggestions .stButton>button {{
+        width: 100%;
+        margin-bottom: 0.35rem;
+    }}
+    .takken-search-suggestions .stButton>button:hover {{
+        border-color: #6366f1;
+    }}
+    </style>
+    """
+    if theme == "ダーク":
+        theme_css = """
+        <style>
+        [data-testid="stAppViewContainer"] {{
+            background-color: #0e1117;
+            color: #e7eefc;
+        }}
+        [data-testid="stSidebar"] {{
+            background-color: #111827;
+        }}
+        .stMetric, .stAlert {{
+            background-color: rgba(255, 255, 255, 0.04);
+        }}
+        </style>
+        """
+    else:
+        theme_css = """
+        <style>
+        [data-testid="stAppViewContainer"] {{
+            background-color: #f8fafc;
+            color: #1f2933;
+        }}
+        [data-testid="stSidebar"] {{
+            background-color: #ffffff;
+        }}
+        </style>
+        """
+    st.markdown(base_css + theme_css, unsafe_allow_html=True)
+
+
+def build_search_dictionary(df: pd.DataFrame) -> List[str]:
+    tokens: Set[str] = set(GLOBAL_SEARCH_SUGGESTIONS + CATEGORY_CHOICES)
+    empty_series = pd.Series(dtype="object")
+    tokens.update(str(cat).strip() for cat in df.get("category", empty_series).dropna())
+    tokens.update(str(topic).strip() for topic in df.get("topic", empty_series).dropna())
+    for tags in df.get("tags", empty_series).dropna():
+        for token in re.split(r"[\s,;、/\\|]+", str(tags)):
+            cleaned = token.strip()
+            if len(cleaned) >= 2:
+                tokens.add(cleaned)
+    tokens = {token for token in tokens if token}
+    return sorted(tokens)
+
+
+def match_search_suggestions(dictionary: List[str], query: str, limit: int = 6) -> List[str]:
+    if not dictionary:
+        return []
+    if not query:
+        return dictionary[:limit]
+    query_lower = query.lower()
+    scored: List[Tuple[float, str]] = []
+    for candidate in dictionary:
+        candidate_lower = candidate.lower()
+        score = fuzz.partial_ratio(query_lower, candidate_lower)
+        if candidate_lower.startswith(query_lower):
+            score += 20
+        scored.append((score, candidate))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    filtered = [candidate for score, candidate in scored if score >= 30]
+    if not filtered:
+        filtered = [candidate for _, candidate in scored[:limit]]
+    return filtered[:limit]
 
 
 def trigger_global_search() -> None:
@@ -644,24 +737,31 @@ def validate_question_records(df: pd.DataFrame) -> List[str]:
     if missing:
         errors.append(f"必須列が不足しています: {', '.join(missing)}")
         return errors
-    if "id" in df.columns:
-        dup_ids = df[df["id"].notna() & df["id"].duplicated()]["id"].unique()
+    working = df.reset_index(drop=True)
+    if "id" in working.columns:
+        dup_ids = working[working["id"].notna() & working["id"].duplicated()]["id"].unique()
         if dup_ids.size > 0:
             errors.append(f"重複したIDが存在します: {', '.join(map(str, dup_ids[:5]))}")
-    dup_keys = df.duplicated(subset=["year", "q_no"], keep=False)
+    dup_keys = working.duplicated(subset=["year", "q_no"], keep=False)
     if dup_keys.any():
-        duplicates = df.loc[dup_keys, ["year", "q_no"]].drop_duplicates()
-        sample = ", ".join(f"{row.year}年問{row.q_no}" for row in duplicates.itertuples())
+        duplicates = working.loc[dup_keys, ["year", "q_no"]].reset_index()
+        sample = ", ".join(
+            f"{row.year}年問{row.q_no} (行{row['index'] + 2})" for _, row in duplicates.head(5).iterrows()
+        )
         errors.append(f"年度と問番の組み合わせが重複しています: {sample}")
-    for idx, row in df.iterrows():
-        if not str(row.get("question", "")).strip():
-            errors.append(f"{row.get('year')}年問{row.get('q_no')}：問題文が空欄です。")
-        choices = [str(row.get(f"choice{i}", "")).strip() for i in range(1, 5)]
-        if "" in choices:
-            errors.append(f"{row.get('year')}年問{row.get('q_no')}：空欄の選択肢があります。")
+    for row_number, row in enumerate(working.itertuples(index=False), start=2):
+        year = getattr(row, "year", "?")
+        q_no = getattr(row, "q_no", "?")
+        label = f"{year}年問{q_no} (行{row_number})"
+        question_text = str(getattr(row, "question", ""))
+        if not question_text.strip():
+            errors.append(f"{label}：問題文が空欄です。")
+        choices = [str(getattr(row, f"choice{i}", "")).strip() for i in range(1, 5)]
+        if any(choice == "" for choice in choices):
+            errors.append(f"{label}：空欄の選択肢があります。")
         non_empty = [c for c in choices if c]
         if len(set(non_empty)) < len(non_empty):
-            errors.append(f"{row.get('year')}年問{row.get('q_no')}：選択肢が重複しています。")
+            errors.append(f"{label}：選択肢が重複しています。")
     return errors
 
 
@@ -672,16 +772,29 @@ def validate_answer_records(df: pd.DataFrame) -> List[str]:
     if missing:
         errors.append(f"必須列が不足しています: {', '.join(missing)}")
         return errors
-    dup_keys = df.duplicated(subset=["year", "q_no"], keep=False)
+    working = df.reset_index(drop=True)
+    dup_keys = working.duplicated(subset=["year", "q_no"], keep=False)
     if dup_keys.any():
-        duplicates = df.loc[dup_keys, ["year", "q_no"]].drop_duplicates()
-        sample = ", ".join(f"{row.year}年問{row.q_no}" for row in duplicates.itertuples())
+        duplicates = working.loc[dup_keys, ["year", "q_no"]].reset_index()
+        sample = ", ".join(
+            f"{row.year}年問{row.q_no} (行{row['index'] + 2})" for _, row in duplicates.head(5).iterrows()
+        )
         errors.append(f"年度と問番の組み合わせが重複しています: {sample}")
-    if (df["correct_number"].isna()).any():
-        errors.append("correct_number に空欄があります。")
-    invalid = df["correct_number"].astype(float)
-    if ((invalid < 1) | (invalid > 4)).any():
-        errors.append("correct_number は1〜4の範囲で指定してください。")
+    if working["correct_number"].isna().any():
+        rows = (working["correct_number"].isna().to_numpy().nonzero()[0] + 2).tolist()
+        rows_text = ", ".join(map(str, rows[:5]))
+        errors.append(f"correct_number に空欄があります (行 {rows_text})。")
+    try:
+        invalid = pd.to_numeric(working["correct_number"], errors="coerce")
+    except Exception:
+        invalid = pd.Series([np.nan] * len(working))
+    out_of_range = working[(invalid < 1) | (invalid > 4) | invalid.isna()]
+    if not out_of_range.empty:
+        sample_rows = ", ".join(
+            f"{row.year}年問{row.q_no} (行{row['index'] + 2})"
+            for _, row in out_of_range.reset_index().head(5).iterrows()
+        )
+        errors.append(f"correct_number は1〜4の範囲で指定してください: {sample_rows}")
     return errors
 
 
@@ -710,6 +823,70 @@ def build_answers_export(df: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(records, columns=ANSWER_TEMPLATE_COLUMNS)
+
+
+def build_sample_questions_csv() -> str:
+    sample_rows = [
+        {
+            "year": 2023,
+            "q_no": 1,
+            "category": "宅建業法",
+            "topic": "免許",
+            "question": "宅地建物取引業者の免許について正しいものはどれか。",
+            "choice1": "免許権者は必ず国土交通大臣である。",
+            "choice2": "法人が免許を受ける場合、専任取引士は不要である。",
+            "choice3": "免許替えの際は旧免許の有効期間を引き継げる。",
+            "choice4": "知事免許業者が二以上の都道府県に事務所を設けるときは大臣免許が必要である。",
+            "explanation": "宅建業法上、二以上の都道府県に事務所を設ける場合は大臣免許が必要。",
+            "difficulty": 3,
+            "tags": "宅建業法;免許",
+        },
+        {
+            "year": 2023,
+            "q_no": 2,
+            "category": "権利関係",
+            "topic": "物権変動",
+            "question": "不動産物権変動の対抗要件に関する記述として正しいものはどれか。",
+            "choice1": "不動産の贈与は口頭でも第三者に対抗できる。",
+            "choice2": "所有権移転登記を備えなければ第三者に対抗できない。",
+            "choice3": "仮登記のままでも常に第三者に優先する。",
+            "choice4": "地上権設定は登記簿の記載を要しない。",
+            "explanation": "不動産物権変動の対抗要件は原則として登記である。",
+            "difficulty": 2,
+            "tags": "権利関係;物権変動",
+        },
+    ]
+    buffer = io.StringIO()
+    pd.DataFrame(sample_rows, columns=QUESTION_TEMPLATE_COLUMNS).to_csv(buffer, index=False)
+    return buffer.getvalue()
+
+
+def build_sample_answers_csv() -> str:
+    sample_rows = [
+        {
+            "year": 2023,
+            "q_no": 1,
+            "correct_number": 4,
+            "correct_label": "D",
+            "correct_text": "知事免許業者が二以上の都道府県に事務所を設けるときは大臣免許が必要。",
+            "explanation": "宅建業法の免許制度に基づき、複数都道府県で営業する場合は大臣免許が必要です。",
+            "difficulty": 3,
+            "tags": "宅建業法;免許",
+        },
+        {
+            "year": 2023,
+            "q_no": 2,
+            "correct_number": 2,
+            "correct_label": "B",
+            "correct_text": "所有権移転登記を備えなければ第三者に対抗できない。",
+            "explanation": "不動産物権変動の対抗要件は登記が原則です。",
+            "difficulty": 2,
+            "tags": "権利関係;物権変動",
+        },
+    ]
+    buffer = io.StringIO()
+    pd.DataFrame(sample_rows, columns=ANSWER_TEMPLATE_COLUMNS).to_csv(buffer, index=False)
+    return buffer.getvalue()
 
 
 def merge_questions_answers(
@@ -1060,7 +1237,66 @@ def render_global_search_panel(db: DBManager, df: pd.DataFrame, query: str) -> N
     if results.empty:
         st.info("該当する問題が見つかりませんでした。フィルタやキーワードを見直してください。")
         return
-    display = results.sort_values(["year", "q_no"], ascending=[False, True]).head(20)
+    with st.expander("並び替え・フィルタ", expanded=False):
+        category_options = sorted({str(cat) for cat in results["category"].dropna()})
+        selected_categories = st.multiselect(
+            "分野で絞り込み",
+            category_options,
+            default=category_options,
+            help="興味のある分野だけを表示します。",
+            key="global_search_categories",
+        )
+        year_values = sorted({int(y) for y in results["year"].dropna().astype(int)})
+        year_range: Optional[Tuple[int, int]]
+        if year_values:
+            min_year, max_year = year_values[0], year_values[-1]
+            if min_year == max_year:
+                st.caption(f"年度フィルタ: {min_year}年のみのデータです。")
+                year_range = (min_year, max_year)
+            else:
+                year_range = st.slider(
+                    "年度範囲",
+                    min_year,
+                    max_year,
+                    (min_year, max_year),
+                    help="学習したい年度に絞り込めます。",
+                    key="global_search_year_range",
+                )
+        else:
+            year_range = None
+        snippet_keyword = st.text_input(
+            "要約内フィルタ",
+            key="global_search_snippet_filter",
+            help="要約に含まれる語句でさらに絞り込みます。",
+        )
+        sort_option = st.selectbox(
+            "並び順",
+            ["関連度順", "年度 (新しい順)", "年度 (古い順)", "問番昇順"],
+            help="検索結果の表示順序を変更できます。",
+            key="global_search_sort",
+        )
+    filtered = results.copy()
+    if selected_categories:
+        filtered = filtered[filtered["category"].isin(selected_categories)]
+    if year_range:
+        filtered = filtered[filtered["year"].between(year_range[0], year_range[1])]
+    if snippet_keyword:
+        filtered = filtered[
+            filtered["snippet"].str.contains(snippet_keyword, case=False, na=False)
+            | filtered["question"].str.contains(snippet_keyword, case=False, na=False)
+        ]
+    if filtered.empty:
+        st.info("条件に合致する結果がありません。フィルタを緩めて再検索してください。")
+        return
+    if sort_option == "年度 (新しい順)":
+        filtered = filtered.sort_values(["year", "q_no"], ascending=[False, True])
+    elif sort_option == "年度 (古い順)":
+        filtered = filtered.sort_values(["year", "q_no"], ascending=[True, True])
+    elif sort_option == "問番昇順":
+        filtered = filtered.sort_values(["q_no", "year"], ascending=[True, False])
+    else:
+        filtered = filtered.sort_values(["year", "q_no"], ascending=[False, True])
+    display = filtered.head(30)
     summary_df = display[
         ["year", "q_no", "category", "topic", "snippet", "id"]
     ].rename(
@@ -1073,7 +1309,17 @@ def render_global_search_panel(db: DBManager, df: pd.DataFrame, query: str) -> N
             "id": "問題ID",
         }
     )
-    st.dataframe(summary_df.set_index("問題ID"), use_container_width=True)
+    st.dataframe(
+        summary_df.set_index("問題ID"),
+        use_container_width=True,
+        column_config={
+            "年度": st.column_config.NumberColumn("年度", format="%d", help="クリックで並び替えできます。"),
+            "問番": st.column_config.NumberColumn("問番", format="%d", help="問番号でソートできます。"),
+            "分野": st.column_config.TextColumn("分野", help="カテゴリ名にマウスオーバーすると全文が表示されます。"),
+            "小分類": st.column_config.TextColumn("小分類", help="細目分類での検索に役立ちます。"),
+            "要約": st.column_config.TextColumn("要約", help="問題文や解説から自動生成したサマリーです。"),
+        },
+    )
     selected_id = st.selectbox(
         "検索結果から問題を開く",
         display["id"],
@@ -1375,6 +1621,7 @@ def init_session_state() -> None:
         "settings": {
             "shuffle_choices": True,
             "theme": "ライト",
+            "font_size": "標準",
             "timer": True,
             "sm2_initial_ease": 2.5,
             "auto_advance": False,
@@ -1390,10 +1637,12 @@ def init_session_state() -> None:
 def main() -> None:
     st.set_page_config(page_title="宅建10年ドリル", layout="wide")
     init_session_state()
+    apply_user_preferences()
     engine = get_engine()
     db = DBManager(engine)
     db.initialize_from_csv()
     df = load_questions_df()
+    search_dictionary = build_search_dictionary(df)
 
     sidebar = st.sidebar
     sidebar.title("宅建10年ドリル")
@@ -1404,6 +1653,19 @@ def main() -> None:
         help="Enterキーまたは『検索』ボタンで実行します。",
         on_change=trigger_global_search,
     )
+    suggestion_container = sidebar.container()
+    current_input = st.session_state.get("global_search_input", "")
+    suggestions = match_search_suggestions(search_dictionary, current_input)
+    if suggestions:
+        with suggestion_container:
+            st.caption("候補キーワード (クリックで検索欄に反映されます)")
+            suggestion_cols = st.columns(2)
+            for idx, keyword in enumerate(suggestions):
+                col = suggestion_cols[idx % 2]
+                if col.button(keyword, key=f"global_suggest_{idx}", type="secondary"):
+                    set_global_search_query(keyword)
+                    trigger_global_search()
+                    safe_rerun()
     search_action_cols = sidebar.columns(2)
     if search_action_cols[0].button("検索", key="global_search_button"):
         trigger_global_search()
@@ -1507,7 +1769,11 @@ def render_full_exam_lane(db: DBManager, df: pd.DataFrame) -> None:
         return
     session: Optional[ExamSession] = st.session_state.get("exam_session")
     if session is None or session.mode != "本試験モード":
-        if st.button("50問模試を開始", key="start_full_exam"):
+        if st.button(
+            "50問模試を開始",
+            key="start_full_exam",
+            help="本試験と同じ50問・120分構成で一気に演習します。結果は統計に反映されます。",
+        ):
             questions = stratified_exam(df)
             if not questions:
                 st.warning("出題可能な問題が不足しています。")
@@ -1722,31 +1988,100 @@ def render_weakness_lane(db: DBManager, df: pd.DataFrame) -> None:
     merged = summary.merge(df[["id", "year", "q_no", "question"]], left_on="question_id", right_on="id", how="left")
     merged = merged.sort_values(["priority", "accuracy"], ascending=[False, True])
     st.markdown("#### 優先出題リスト")
-    st.dataframe(
-        merged.head(10)[
-            [
-                "question_id",
-                "category",
-                "year",
-                "q_no",
-                "accuracy",
-                "attempts_count",
-                "avg_seconds",
-            ]
-        ].rename(
-            columns={
-                "question_id": "問題ID",
-                "category": "分野",
-                "year": "年度",
-                "q_no": "問",
-                "accuracy": "正答率",
-                "attempts_count": "挑戦回数",
-                "avg_seconds": "平均解答時間(秒)",
-            }
-        ),
-        use_container_width=True,
+    with st.expander("並び替え・フィルタ", expanded=False):
+        category_options = sorted({str(cat) for cat in merged["category"].dropna()})
+        selected_categories = st.multiselect(
+            "分野",
+            category_options,
+            default=category_options,
+            help="重点的に復習したい分野を選びます。",
+            key="weakness_categories",
+        )
+        max_attempts = int(merged["attempts_count"].max()) if not merged.empty else 1
+        min_attempts = int(merged["attempts_count"].min()) if not merged.empty else 0
+        if min_attempts == max_attempts:
+            attempts_threshold = max_attempts
+            st.caption(f"挑戦回数フィルタ: {max_attempts} 回のみのデータです。")
+        else:
+            attempts_threshold = st.slider(
+                "最低挑戦回数",
+                min_attempts,
+                max_attempts,
+                min(min_attempts + 1, max_attempts),
+                help="指定回数以上取り組んだ問題を対象にします。",
+                key="weakness_attempts_threshold",
+            )
+        accuracy_ceiling = st.slider(
+            "正答率の上限 (%)",
+            0,
+            100,
+            70,
+            step=5,
+            help="この値より正答率が高い問題はリストから除外します。",
+            key="weakness_accuracy_ceiling",
+        )
+        sort_option = st.selectbox(
+            "並び順",
+            ["優先度が高い順", "正答率が低い順", "挑戦回数が多い順", "年度が新しい順"],
+            help="復習リストの並び替え基準を変更します。",
+            key="weakness_sort",
+        )
+    filtered = merged.copy()
+    if selected_categories:
+        filtered = filtered[filtered["category"].isin(selected_categories)]
+    if attempts_threshold:
+        filtered = filtered[filtered["attempts_count"] >= attempts_threshold]
+    filtered = filtered[filtered["accuracy"] * 100 <= accuracy_ceiling]
+    if sort_option == "正答率が低い順":
+        filtered = filtered.sort_values(["accuracy", "attempts_count"], ascending=[True, False])
+    elif sort_option == "挑戦回数が多い順":
+        filtered = filtered.sort_values(["attempts_count", "accuracy"], ascending=[False, True])
+    elif sort_option == "年度が新しい順":
+        filtered = filtered.sort_values(["year", "priority"], ascending=[False, False])
+    else:
+        filtered = filtered.sort_values(["priority", "accuracy"], ascending=[False, True])
+    if filtered.empty:
+        st.info("条件に合致する弱点候補がありません。フィルタ設定を見直してください。")
+        return
+    display_df = filtered.head(15)[
+        [
+            "question_id",
+            "category",
+            "year",
+            "q_no",
+            "accuracy",
+            "attempts_count",
+            "avg_seconds",
+        ]
+    ].rename(
+        columns={
+            "question_id": "問題ID",
+            "category": "分野",
+            "year": "年度",
+            "q_no": "問",
+            "accuracy": "正答率",
+            "attempts_count": "挑戦回数",
+            "avg_seconds": "平均解答時間(秒)",
+        }
     )
-    candidates = merged[~merged["id"].isna()]
+    display_df["正答率"] = display_df["正答率"].astype(float) * 100
+    st.dataframe(
+        display_df.set_index("問題ID"),
+        use_container_width=True,
+        column_config={
+            "分野": st.column_config.TextColumn("分野", help="復習対象のカテゴリです。"),
+            "年度": st.column_config.NumberColumn("年度", format="%d", help="最新年度をクリックでソートできます。"),
+            "問": st.column_config.NumberColumn("問", format="%d", help="年度内での問題番号です。"),
+            "正答率": st.column_config.NumberColumn("正答率", format="%.0f%%", help="低いほど優先的に復習したい問題です。"),
+            "挑戦回数": st.column_config.NumberColumn("挑戦回数", format="%d", help="取り組んだ回数です。"),
+            "平均解答時間(秒)": st.column_config.NumberColumn(
+                "平均解答時間(秒)",
+                format="%.1f",
+                help="長考した問題はミスの温床になりがちです。",
+            ),
+        },
+    )
+    candidates = filtered[~filtered["id"].isna()]
     if candidates.empty:
         st.info("弱点候補の問題を特定できませんでした。履歴を増やしましょう。")
         return
@@ -1799,7 +2134,11 @@ def render_exam_session_body(
         )
         if choice is not None:
             responses[qid] = choice
-    if st.button("採点する", key=f"{key_prefix}_grade"):
+    if st.button(
+        "採点する",
+        key=f"{key_prefix}_grade",
+        help="現在の回答を保存し、正答率や分野別統計を表示します。",
+    ):
         evaluate_exam_attempt(db, df, session, responses, pass_line)
 
 
@@ -2223,9 +2562,17 @@ def render_mock_exam(db: DBManager, df: pd.DataFrame) -> None:
         st.warning("設問データがありません。")
         return
     with st.form("mock_exam_form"):
-        year_mode = st.selectbox("出題方式", ["最新年度", "年度選択", "層化ランダム50"])
+        year_mode = st.selectbox(
+            "出題方式",
+            ["最新年度", "年度選択", "層化ランダム50"],
+            help="最新年度の全問、任意年度のみ、または分野バランスを取った50問から選べます。",
+        )
         if year_mode == "年度選択":
-            selected_year = st.selectbox("年度", sorted(df["year"].unique(), reverse=True))
+            selected_year = st.selectbox(
+                "年度",
+                sorted(df["year"].unique(), reverse=True),
+                help="模試に使用する年度を選択します。",
+            )
             subset = df[df["year"] == selected_year]
             questions = list(subset["id"])
         elif year_mode == "最新年度":
@@ -2234,7 +2581,7 @@ def render_mock_exam(db: DBManager, df: pd.DataFrame) -> None:
             questions = list(subset["id"])
         else:
             questions = stratified_exam(df)
-        submit = st.form_submit_button("模試開始")
+        submit = st.form_submit_button("模試開始", help="選択した条件で模試を開始し、即座に試験画面へ移動します。")
     if submit:
         st.session_state.pop("exam_result_模試", None)
         st.session_state["exam_session"] = ExamSession(
@@ -2262,8 +2609,18 @@ def render_srs(db: DBManager) -> None:
     for _, row in due_df.iterrows():
         st.markdown(f"### {row['question'][:40]}...")
         st.write(f"分野: {row['category']} / 期限: {row['due_date']}")
-        grade = st.slider(f"評価 ({row['question_id']})", 0, 5, 3)
-        if st.button("評価を保存", key=f"srs_save_{row['question_id']}"):
+        grade = st.slider(
+            f"評価 ({row['question_id']})",
+            0,
+            5,
+            3,
+            help="5=完全に覚えた、0=全く覚えていない。評価に応じて次回復習日が変わります。",
+        )
+        if st.button(
+            "評価を保存",
+            key=f"srs_save_{row['question_id']}",
+            help="SM-2アルゴリズムに基づき次回の出題タイミングを更新します。",
+        ):
             initial_ease = st.session_state["settings"].get("sm2_initial_ease", 2.5)
             payload = sm2_update(row, grade, initial_ease=initial_ease)
             db.upsert_srs(row["question_id"], payload)
@@ -2304,19 +2661,25 @@ def render_stats(db: DBManager, df: pd.DataFrame) -> None:
         st.warning("集計対象の設問が特定できませんでした。設問データが削除されていないか確認してください。")
         st.info("『データ入出力』でquestions.csvを再度取り込み、設問IDと学習履歴の対応を復元できます。")
         return
-    accuracy = merged["is_correct"].mean()
-    avg_seconds = merged["seconds"].mean()
-    avg_confidence = merged["confidence"].mean()
+    accuracy_series = merged["is_correct"].dropna()
+    seconds_series = merged["seconds"].dropna()
+    confidence_series = merged["confidence"].dropna()
+    accuracy = accuracy_series.mean() if not accuracy_series.empty else np.nan
+    avg_seconds = seconds_series.mean() if not seconds_series.empty else np.nan
+    avg_confidence = confidence_series.mean() if not confidence_series.empty else np.nan
     st.subheader("サマリー")
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("挑戦回数", f"{len(merged)} 回")
     with col2:
-        st.metric("平均正答率", f"{accuracy * 100:.1f}%")
+        accuracy_text = f"{accuracy * 100:.1f}%" if not np.isnan(accuracy) else "--"
+        st.metric("平均正答率", accuracy_text)
     with col3:
         st.metric("平均解答時間", f"{avg_seconds:.1f} 秒" if not np.isnan(avg_seconds) else "--")
     if not np.isnan(avg_confidence):
         st.caption(f"平均確信度: {avg_confidence:.1f}%")
+    else:
+        st.caption("平均確信度: -- (十分なデータがありません)")
 
     import altair as alt
 
@@ -2331,68 +2694,84 @@ def render_stats(db: DBManager, df: pd.DataFrame) -> None:
         .reset_index()
     )
     if category_stats.empty:
-        st.info("分野情報が未登録の設問が多いようです。questions.csv の category 列を確認してください。")
+        st.info("分野情報の十分なデータがありません。questions.csv の category 列を確認してください。")
     else:
-        accuracy_chart = (
-            alt.Chart(category_stats)
-            .mark_bar()
-            .encode(
-                x=alt.X("category", title="分野"),
-                y=alt.Y("accuracy", title="正答率", axis=alt.Axis(format="%")),
-                tooltip=["category", alt.Tooltip("accuracy", format=".2%"), "attempts_count"],
+        try:
+            accuracy_chart = (
+                alt.Chart(category_stats)
+                .mark_bar()
+                .encode(
+                    x=alt.X("category", title="分野"),
+                    y=alt.Y("accuracy", title="正答率", axis=alt.Axis(format="%")),
+                    tooltip=["category", alt.Tooltip("accuracy", format=".2%"), "attempts_count"],
+                )
+                .properties(height=320)
             )
-            .properties(height=320)
-        )
-        st.altair_chart(accuracy_chart, use_container_width=True)
-        time_chart = (
-            alt.Chart(category_stats)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("category", title="分野"),
-                y=alt.Y("avg_seconds", title="平均解答時間 (秒)", scale=alt.Scale(zero=False)),
-                tooltip=["category", alt.Tooltip("avg_seconds", format=".1f"), "attempts_count"],
+            st.altair_chart(accuracy_chart, use_container_width=True)
+        except Exception as exc:
+            st.warning(f"分野別正答率グラフを表示できませんでした ({exc})")
+            st.caption("十分なデータが集まると自動で表示されます。")
+        try:
+            time_chart = (
+                alt.Chart(category_stats)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("category", title="分野"),
+                    y=alt.Y("avg_seconds", title="平均解答時間 (秒)", scale=alt.Scale(zero=False)),
+                    tooltip=["category", alt.Tooltip("avg_seconds", format=".1f"), "attempts_count"],
+                )
             )
-        )
-        st.altair_chart(time_chart, use_container_width=True)
+            st.altair_chart(time_chart, use_container_width=True)
+        except Exception as exc:
+            st.warning(f"分野別時間グラフを表示できませんでした ({exc})")
+            st.caption("十分なデータが集まると自動で表示されます。")
 
     st.subheader("確信度と正答の相関")
     valid_conf = merged.dropna(subset=["confidence"])
     if valid_conf.empty:
-        st.info("確信度データがまだありません。学習時にスライダーで自己評価してみましょう。")
+        st.info("確信度データがまだ十分ではありません。学習時にスライダーで自己評価してみましょう。")
     else:
         corr = valid_conf["confidence"].corr(valid_conf["is_correct"])
         st.metric("相関係数", f"{corr:.2f}")
-        scatter = (
-            alt.Chart(valid_conf)
-            .mark_circle(opacity=0.6)
-            .encode(
-                x=alt.X("confidence", title="確信度 (%)"),
-                y=alt.Y("is_correct", title="正答 (1=正解)", scale=alt.Scale(domain=[-0.1, 1.1])),
-                color=alt.Color("category", legend=None),
-                tooltip=["category", "topic", "confidence", "is_correct", "seconds"],
+        try:
+            scatter = (
+                alt.Chart(valid_conf)
+                .mark_circle(opacity=0.6)
+                .encode(
+                    x=alt.X("confidence", title="確信度 (%)"),
+                    y=alt.Y("is_correct", title="正答 (1=正解)", scale=alt.Scale(domain=[-0.1, 1.1])),
+                    color=alt.Color("category", legend=None),
+                    tooltip=["category", "topic", "confidence", "is_correct", "seconds"],
+                )
             )
-        )
-        st.altair_chart(scatter, use_container_width=True)
+            st.altair_chart(scatter, use_container_width=True)
+        except Exception as exc:
+            st.warning(f"相関散布図を表示できませんでした ({exc})")
+            st.caption("十分なデータが集まると自動で表示されます。")
 
     st.subheader("ひっかけ語彙ヒートマップ")
     heatmap_df = compute_tricky_vocab_heatmap(merged, df)
     if heatmap_df.empty:
-        st.info("誤答語彙のデータがまだ十分ではありません。")
+        st.info("誤答語彙の十分なデータがありません。")
     else:
-        word_order = (
-            heatmap_df.groupby("word")["count"].sum().sort_values(ascending=False).index.tolist()
-        )
-        heatmap = (
-            alt.Chart(heatmap_df)
-            .mark_rect()
-            .encode(
-                x=alt.X("category", title="分野"),
-                y=alt.Y("word", title="語彙", sort=word_order),
-                color=alt.Color("count", title="誤答回数", scale=alt.Scale(scheme="reds")),
-                tooltip=["word", "category", "count"],
+        try:
+            word_order = (
+                heatmap_df.groupby("word")["count"].sum().sort_values(ascending=False).index.tolist()
             )
-        )
-        st.altair_chart(heatmap, use_container_width=True)
+            heatmap = (
+                alt.Chart(heatmap_df)
+                .mark_rect()
+                .encode(
+                    x=alt.X("category", title="分野"),
+                    y=alt.Y("word", title="語彙", sort=word_order),
+                    color=alt.Color("count", title="誤答回数", scale=alt.Scale(scheme="reds")),
+                    tooltip=["word", "category", "count"],
+                )
+            )
+            st.altair_chart(heatmap, use_container_width=True)
+        except Exception as exc:
+            st.warning(f"語彙ヒートマップを表示できませんでした ({exc})")
+            st.caption("十分なデータが集まると自動で表示されます。")
 
     st.subheader("最も改善した論点")
     improvement = compute_most_improved_topic(merged, df)
@@ -2413,6 +2792,24 @@ def render_data_io(db: DBManager) -> None:
         mime="application/zip",
     )
     st.caption("設問・正答データのCSV/XLSXテンプレートが含まれます。必要に応じて編集してご利用ください。")
+    sample_cols = st.columns(2)
+    with sample_cols[0]:
+        st.download_button(
+            "サンプル questions.csv",
+            data=build_sample_questions_csv(),
+            file_name="sample_questions.csv",
+            mime="text/csv",
+            help="Excelで開いて値を上書きすれば、そのまま取り込みできます。",
+        )
+    with sample_cols[1]:
+        st.download_button(
+            "サンプル answers.csv",
+            data=build_sample_answers_csv(),
+            file_name="sample_answers.csv",
+            mime="text/csv",
+            help="正答番号や解説の記入例です。コピーしてご利用ください。",
+        )
+    st.caption("サンプルCSVはExcelに貼り付けて使えるよう列幅を調整済みです。コピー&ペーストで手早く登録できます。")
     st.markdown("### クイックインポート (questions.csv / answers.csv)")
     quick_cols = st.columns(2)
     with quick_cols[0]:
@@ -2795,6 +3192,15 @@ def render_settings() -> None:
         ["ライト", "ダーク"],
         index=0 if settings.get("theme") == "ライト" else 1,
         help="画面の配色を切り替えます。暗い環境ではダークテーマがおすすめです。",
+    )
+    size_options = list(FONT_SIZE_SCALE.keys())
+    default_size = settings.get("font_size", "標準")
+    size_index = size_options.index(default_size) if default_size in size_options else size_options.index("標準")
+    settings["font_size"] = st.selectbox(
+        "フォントサイズ",
+        size_options,
+        index=size_index,
+        help="文字サイズを調整して読みやすさを最適化します。『大きい』は夜間学習や高解像度モニタ向きです。",
     )
     settings["shuffle_choices"] = st.checkbox(
         "選択肢をシャッフル",
