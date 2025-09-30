@@ -19,7 +19,8 @@ from sqlalchemy import (JSON, Column, Date, DateTime, Float, Integer, MetaData,
                         select)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.sql import insert, text, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.sql import insert as sa_insert, text, update
 
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "takken.db"
@@ -166,7 +167,7 @@ class DBManager:
             else:
                 existing = set()
             for rec in records:
-                stmt = insert(questions_table).values(**rec)
+                stmt = sqlite_insert(questions_table).values(**rec)
                 do_update_stmt = stmt.on_conflict_do_update(
                     index_elements=[questions_table.c.id],
                     set_={
@@ -200,7 +201,7 @@ class DBManager:
     ) -> None:
         with self.engine.begin() as conn:
             conn.execute(
-                insert(attempts_table).values(
+                sa_insert(attempts_table).values(
                     question_id=question_id,
                     selected=selected,
                     is_correct=int(is_correct),
@@ -249,7 +250,7 @@ class DBManager:
 
     def upsert_srs(self, question_id: str, payload: Dict[str, Optional[str]]) -> None:
         with self.engine.begin() as conn:
-            stmt = insert(srs_table).values(question_id=question_id, **payload)
+            stmt = sqlite_insert(srs_table).values(question_id=question_id, **payload)
             do_update = stmt.on_conflict_do_update(
                 index_elements=[srs_table.c.question_id],
                 set_={key: getattr(stmt.excluded, key) for key in payload},
@@ -258,12 +259,12 @@ class DBManager:
 
     def log_import(self, payload: Dict[str, Optional[str]]) -> None:
         with self.engine.begin() as conn:
-            conn.execute(insert(import_logs_table).values(**payload))
+            conn.execute(sa_insert(import_logs_table).values(**payload))
 
     def save_mapping_profile(self, name: str, kind: str, mapping: Dict[str, str]) -> None:
         with self.engine.begin() as conn:
             conn.execute(
-                insert(mapping_profiles_table).values(
+                sa_insert(mapping_profiles_table).values(
                     name=name,
                     kind=kind,
                     mapping_json=mapping,
