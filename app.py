@@ -8,6 +8,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from string import Template
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus
 
@@ -183,6 +184,33 @@ def ensure_directories() -> None:
     OFFLINE_EXPORT_DIR.mkdir(exist_ok=True)
 
 
+def inject_style(css: str, style_id: str) -> None:
+    sanitized_css = css.strip()
+    if not sanitized_css:
+        return
+    css_payload = json.dumps(sanitized_css)
+    style_id_payload = json.dumps(style_id)
+    script = Template(
+        """
+        <script>
+        (function() {
+            const css = $css;
+            const styleId = $style_id;
+            const doc = window.parent ? window.parent.document : document;
+            let styleTag = doc.getElementById(styleId);
+            if (!styleTag) {
+                styleTag = doc.createElement('style');
+                styleTag.id = styleId;
+                doc.head.appendChild(styleTag);
+            }
+            styleTag.innerHTML = css;
+        })();
+        </script>
+        """
+    ).substitute(css=css_payload, style_id=style_id_payload)
+    html(script, height=0)
+
+
 def ensure_schema_migrations(engine: Engine) -> None:
     inspector = inspect(engine)
     with engine.begin() as conn:
@@ -199,50 +227,44 @@ def apply_user_preferences() -> None:
     font_label = settings.get("font_size", "標準")
     scale = FONT_SIZE_SCALE.get(font_label, 1.0)
     base_css = f"""
-    <style>
-    :root {{
-        --takken-font-scale: {scale};
-    }}
-    [data-testid="stAppViewContainer"] * {{
-        font-size: calc(1rem * var(--takken-font-scale));
-    }}
-    .takken-search-suggestions .stButton>button {{
-        width: 100%;
-        margin-bottom: 0.35rem;
-    }}
-    .takken-search-suggestions .stButton>button:hover {{
-        border-color: #6366f1;
-    }}
-    </style>
-    """
+:root {{
+    --takken-font-scale: {scale};
+}}
+[data-testid="stAppViewContainer"] * {{
+    font-size: calc(1rem * var(--takken-font-scale));
+}}
+.takken-search-suggestions .stButton>button {{
+    width: 100%;
+    margin-bottom: 0.35rem;
+}}
+.takken-search-suggestions .stButton>button:hover {{
+    border-color: #6366f1;
+}}
+"""
     if theme == "ダーク":
         theme_css = """
-        <style>
-        [data-testid="stAppViewContainer"] {{
-            background-color: #0e1117;
-            color: #e7eefc;
-        }}
-        [data-testid="stSidebar"] {{
-            background-color: #111827;
-        }}
-        .stMetric, .stAlert {{
-            background-color: rgba(255, 255, 255, 0.04);
-        }}
-        </style>
-        """
+[data-testid="stAppViewContainer"] {
+    background-color: #0e1117;
+    color: #e7eefc;
+}
+[data-testid="stSidebar"] {
+    background-color: #111827;
+}
+.stMetric, .stAlert {
+    background-color: rgba(255, 255, 255, 0.04);
+}
+"""
     else:
         theme_css = """
-        <style>
-        [data-testid="stAppViewContainer"] {{
-            background-color: #f8fafc;
-            color: #1f2933;
-        }}
-        [data-testid="stSidebar"] {{
-            background-color: #ffffff;
-        }}
-        </style>
-        """
-    st.markdown(base_css + theme_css, unsafe_allow_html=True)
+[data-testid="stAppViewContainer"] {
+    background-color: #f8fafc;
+    color: #1f2933;
+}
+[data-testid="stSidebar"] {
+    background-color: #ffffff;
+}
+"""
+    inject_style(base_css + theme_css, "takken-theme-styles")
 
 
 def build_search_dictionary(df: pd.DataFrame) -> List[str]:
@@ -1071,32 +1093,30 @@ def sm2_update(row: Optional[pd.Series], grade: int, initial_ease: float = 2.5) 
 def inject_ui_styles() -> None:
     if st.session_state.get("_ui_styles_injected"):
         return
-    st.markdown(
+    inject_style(
         """
-        <style>
-        .takken-choice-button button {
-            width: 100%;
-            min-height: 56px;
-            font-size: 1.05rem;
-            border-radius: 0.8rem;
-        }
-        .takken-choice-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 0.75rem;
-            margin-bottom: 0.5rem;
-        }
-        @media (max-width: 768px) {
-            .takken-choice-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-        .takken-inline-actions button {
-            min-height: 48px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
+.takken-choice-button button {
+    width: 100%;
+    min-height: 56px;
+    font-size: 1.05rem;
+    border-radius: 0.8rem;
+}
+.takken-choice-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 0.5rem;
+}
+@media (max-width: 768px) {
+    .takken-choice-grid {
+        grid-template-columns: 1fr;
+    }
+}
+.takken-inline-actions button {
+    min-height: 48px;
+}
+""",
+        "takken-ui-styles",
     )
     st.session_state["_ui_styles_injected"] = True
 
