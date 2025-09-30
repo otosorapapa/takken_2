@@ -3,10 +3,12 @@ import hashlib
 import io
 import json
 import random
+import re
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus
 
 import numpy as np
@@ -19,6 +21,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sqlalchemy import (JSON, Column, Date, DateTime, Float, Integer, MetaData,
                         String, Table, UniqueConstraint, create_engine, func,
                         select)
+from sqlalchemy import inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -79,6 +82,8 @@ attempts_table = Table(
     Column("seconds", Integer),
     Column("mode", String),
     Column("exam_id", Integer),
+    Column("confidence", Integer),
+    Column("grade", Integer),
     Column("created_at", DateTime, server_default=func.now()),
 )
 
@@ -139,6 +144,16 @@ def ensure_directories() -> None:
     UPLOAD_DIR.mkdir(exist_ok=True)
     REJECT_DIR.mkdir(exist_ok=True)
     OFFLINE_EXPORT_DIR.mkdir(exist_ok=True)
+
+
+def ensure_schema_migrations(engine: Engine) -> None:
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        attempt_columns = {col["name"] for col in inspector.get_columns("attempts")}
+        if "confidence" not in attempt_columns:
+            conn.execute(text("ALTER TABLE attempts ADD COLUMN confidence INTEGER"))
+        if "grade" not in attempt_columns:
+            conn.execute(text("ALTER TABLE attempts ADD COLUMN grade INTEGER"))
 
 
 QUESTION_TEMPLATE_COLUMNS = [
@@ -230,6 +245,7 @@ def get_engine() -> Engine:
     ensure_directories()
     engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
     metadata.create_all(engine)
+    ensure_schema_migrations(engine)
     return engine
 
 
@@ -288,6 +304,8 @@ class DBManager:
         seconds: int,
         mode: str,
         exam_id: Optional[int] = None,
+        confidence: Optional[int] = None,
+        grade: Optional[int] = None,
     ) -> None:
         with self.engine.begin() as conn:
             conn.execute(
@@ -298,6 +316,8 @@ class DBManager:
                     seconds=seconds,
                     mode=mode,
                     exam_id=exam_id,
+                    confidence=confidence,
+                    grade=grade,
                 )
             )
 
@@ -339,12 +359,15 @@ class DBManager:
                     SELECT
                         a.question_id,
                         q.category,
+                        q.topic,
                         q.year,
                         a.is_correct,
                         a.created_at,
                         a.seconds,
                         a.selected,
-                        a.mode
+                        a.mode,
+                        a.confidence,
+                        a.grade
                     FROM attempts a
                     JOIN questions q ON q.id = a.question_id
                     """
@@ -517,6 +540,89 @@ def normalize_answers(df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None
     return df
 
 
+def validate_question_records(df: pd.DataFrame) -> List[str]:
+    errors: List[str] = []
+    required_cols = [
+        "year",
+        "q_no",
+        "question",
+        "choice1",
+        "choice2",
+        "choice3",
+        "choice4",
+    ]
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        errors.append(f"必須列が不足しています: {', '.join(missing)}")
+        return errors
+    if "id" in df.columns:
+        dup_ids = df[df["id"].notna() & df["id"].duplicated()]["id"].unique()
+        if dup_ids.size > 0:
+            errors.append(f"重複したIDが存在します: {', '.join(map(str, dup_ids[:5]))}")
+    dup_keys = df.duplicated(subset=["year", "q_no"], keep=False)
+    if dup_keys.any():
+        duplicates = df.loc[dup_keys, ["year", "q_no"]].drop_duplicates()
+        sample = ", ".join(f"{row.year}年問{row.q_no}" for row in duplicates.itertuples())
+        errors.append(f"年度と問番の組み合わせが重複しています: {sample}")
+    for idx, row in df.iterrows():
+        if not str(row.get("question", "")).strip():
+            errors.append(f"{row.get('year')}年問{row.get('q_no')}：問題文が空欄です。")
+        choices = [str(row.get(f"choice{i}", "")).strip() for i in range(1, 5)]
+        if "" in choices:
+            errors.append(f"{row.get('year')}年問{row.get('q_no')}：空欄の選択肢があります。")
+        non_empty = [c for c in choices if c]
+        if len(set(non_empty)) < len(non_empty):
+            errors.append(f"{row.get('year')}年問{row.get('q_no')}：選択肢が重複しています。")
+    return errors
+
+
+def validate_answer_records(df: pd.DataFrame) -> List[str]:
+    errors: List[str] = []
+    required_cols = ["year", "q_no", "correct_number"]
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        errors.append(f"必須列が不足しています: {', '.join(missing)}")
+        return errors
+    dup_keys = df.duplicated(subset=["year", "q_no"], keep=False)
+    if dup_keys.any():
+        duplicates = df.loc[dup_keys, ["year", "q_no"]].drop_duplicates()
+        sample = ", ".join(f"{row.year}年問{row.q_no}" for row in duplicates.itertuples())
+        errors.append(f"年度と問番の組み合わせが重複しています: {sample}")
+    if (df["correct_number"].isna()).any():
+        errors.append("correct_number に空欄があります。")
+    invalid = df["correct_number"].astype(float)
+    if ((invalid < 1) | (invalid > 4)).any():
+        errors.append("correct_number は1〜4の範囲で指定してください。")
+    return errors
+
+
+def build_answers_export(df: pd.DataFrame) -> pd.DataFrame:
+    records: List[Dict[str, object]] = []
+    for _, row in df.iterrows():
+        correct_number = row.get("correct")
+        if pd.isna(correct_number):
+            correct_number = None
+            correct_label = ""
+            correct_text = ""
+        else:
+            correct_number = int(correct_number)
+            correct_label = ["A", "B", "C", "D"][correct_number - 1]
+            correct_text = str(row.get(f"choice{correct_number}", ""))
+        records.append(
+            {
+                "year": row.get("year"),
+                "q_no": row.get("q_no"),
+                "correct_number": correct_number,
+                "correct_label": correct_label,
+                "correct_text": correct_text,
+                "explanation": row.get("explanation", ""),
+                "difficulty": row.get("difficulty"),
+                "tags": row.get("tags", ""),
+            }
+        )
+    return pd.DataFrame(records, columns=ANSWER_TEMPLATE_COLUMNS)
+
+
 def merge_questions_answers(
     questions: pd.DataFrame,
     answers: pd.DataFrame,
@@ -673,13 +779,12 @@ def sm2_update(row: Optional[pd.Series], grade: int, initial_ease: float = 2.5) 
         repetition = row.get("repetition", 0) or 0
         interval = row.get("interval", 1) or 1
         ease = row.get("ease", 2.5) or 2.5
+    schedule = [1, 3, 7, 21]
     if grade >= 3:
-        if repetition == 0:
-            interval = 1
-        elif repetition == 1:
-            interval = 6
+        if repetition < len(schedule):
+            interval = schedule[repetition]
         else:
-            interval = int(round(interval * ease))
+            interval = int(round(max(interval, schedule[-1]) * ease))
         repetition += 1
     else:
         repetition = 0
@@ -808,6 +913,277 @@ def render_offline_downloads(key_prefix: str) -> None:
         st.caption(f"ファイルは {OFFLINE_EXPORT_DIR.as_posix()} にも自動保存されます。")
 
 
+def build_snippet(text: str, keyword: str, width: int = 80) -> str:
+    if not text:
+        return ""
+    pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+    match = pattern.search(text)
+    cleaned = re.sub(r"\s+", " ", text)
+    if not match:
+        return (cleaned[:width] + "…") if len(cleaned) > width else cleaned
+    start = max(0, match.start() - width // 2)
+    end = min(len(cleaned), match.end() + width // 2)
+    snippet = cleaned[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(cleaned):
+        snippet = snippet + "…"
+    return snippet
+
+
+def search_questions(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    keywords = [kw.strip() for kw in re.split(r"[\s　]+", query) if kw.strip()]
+    if not keywords:
+        return df.iloc[0:0]
+    mask = pd.Series(True, index=df.index)
+    choice_cols = [f"choice{i}" for i in range(1, 5)]
+    for kw in keywords:
+        pattern = re.escape(kw)
+        col_mask = df["question"].fillna("").str.contains(pattern, case=False, na=False)
+        col_mask |= df["topic"].fillna("").str.contains(pattern, case=False, na=False)
+        col_mask |= df["tags"].fillna("").str.contains(pattern, case=False, na=False)
+        for col in choice_cols:
+            col_mask |= df[col].fillna("").str.contains(pattern, case=False, na=False)
+        mask &= col_mask
+    results = df[mask].copy()
+    if results.empty:
+        return results
+    primary = keywords[0]
+    results["snippet"] = results.apply(
+        lambda row: build_snippet(
+            "\n".join(
+                [
+                    str(row.get("question", "")),
+                    *(str(row.get(f"choice{i}", "")) for i in range(1, 5)),
+                    str(row.get("explanation", "")),
+                ]
+            ),
+            primary,
+        ),
+        axis=1,
+    )
+    return results
+
+
+def render_global_search_panel(db: DBManager, df: pd.DataFrame, query: str) -> None:
+    st.markdown("## 🔍 横断検索結果")
+    results = search_questions(df, query)
+    if results.empty:
+        st.info("該当する問題が見つかりませんでした。フィルタやキーワードを見直してください。")
+        return
+    display = results.sort_values(["year", "q_no"], ascending=[False, True]).head(20)
+    summary_df = display[
+        ["year", "q_no", "category", "topic", "snippet", "id"]
+    ].rename(
+        columns={
+            "year": "年度",
+            "q_no": "問番",
+            "category": "分野",
+            "topic": "小分類",
+            "snippet": "要約",
+            "id": "問題ID",
+        }
+    )
+    st.dataframe(summary_df.set_index("問題ID"), use_container_width=True)
+    selected_id = st.selectbox(
+        "検索結果から問題を開く",
+        display["id"],
+        format_func=lambda x: format_question_label(df, x),
+        key="global_search_select",
+    )
+    row = df[df["id"] == selected_id].iloc[0]
+    render_question_interaction(db, row, attempt_mode="search", key_prefix="search")
+
+
+def get_review_candidate_ids(db: DBManager) -> Set[str]:
+    review_ids: Set[str] = set()
+    attempts = db.get_attempt_stats()
+    if not attempts.empty:
+        attempts["created_at"] = pd.to_datetime(attempts["created_at"])
+        last_attempts = (
+            attempts.sort_values("created_at").groupby("question_id", as_index=False).tail(1)
+        )
+        review_ids.update(last_attempts[last_attempts["is_correct"] == 0]["question_id"].tolist())
+        low_conf = int(st.session_state["settings"].get("review_low_confidence_threshold", 60))
+        if "confidence" in last_attempts.columns:
+            confidence_series = last_attempts["confidence"].fillna(101)
+            review_ids.update(
+                last_attempts[confidence_series <= low_conf]["question_id"].tolist()
+            )
+        days_threshold = int(st.session_state["settings"].get("review_elapsed_days", 7))
+        cutoff = dt.datetime.now() - dt.timedelta(days=days_threshold)
+        review_ids.update(
+            last_attempts[last_attempts["created_at"] <= cutoff]["question_id"].tolist()
+        )
+    srs_due = db.get_due_srs()
+    if not srs_due.empty:
+        review_ids.update(srs_due["question_id"].tolist())
+    return {str(qid) for qid in review_ids if pd.notna(qid)}
+
+
+def parse_explanation_sections(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    if not text:
+        return "", []
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    sections: List[Tuple[str, str]] = []
+    summary = ""
+    for line in lines:
+        match = re.match(r"^【([^】]+)】(.*)$", line)
+        if match:
+            label = match.group(1).strip()
+            content = match.group(2).strip()
+        else:
+            label = "補足"
+            content = line.strip()
+        sections.append((label, content))
+        if not summary and label in ("要点", "結論") and content:
+            summary = content
+    if not summary and lines:
+        summary = lines[0]
+    summary = summary.strip()
+    if len(summary) > 80:
+        summary = summary[:77] + "…"
+    return summary, sections
+
+
+def render_explanation_content(row: pd.Series) -> None:
+    explanation = row.get("explanation", "")
+    summary, sections = parse_explanation_sections(explanation)
+    if not explanation:
+        st.write("解説が未登録です。データ入出力から解答データを取り込みましょう。")
+        return
+    st.markdown(f"**要点版**：{summary}")
+    with st.expander("詳細解説をひらく", expanded=False):
+        for label, content in sections:
+            if not content:
+                continue
+            if label == "ミニ図":
+                st.markdown(f"**{label}**")
+                st.markdown(content, unsafe_allow_html=True)
+            else:
+                st.markdown(f"- **{label}**：{content}")
+        similar = compute_similarity(row["id"])
+        if not similar.empty:
+            st.markdown("#### 類似問題")
+            st.dataframe(similar, use_container_width=True)
+
+
+def estimate_theta(attempts: pd.DataFrame, df: pd.DataFrame) -> Optional[float]:
+    if attempts.empty:
+        return None
+    merged = attempts.merge(
+        df[["id", "difficulty"]], left_on="question_id", right_on="id", how="left"
+    )
+    merged = merged.dropna(subset=["difficulty"])
+    if merged.empty:
+        return None
+    difficulties = (merged["difficulty"].astype(float) - 3.0) * 0.7
+    responses = merged["is_correct"].astype(float)
+    theta = 0.0
+    for _ in range(10):
+        logits = theta - difficulties
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        gradient = np.sum(responses - probs)
+        hessian = -np.sum(probs * (1 - probs))
+        if abs(hessian) < 1e-6:
+            break
+        theta -= gradient / hessian
+        if abs(gradient) < 1e-4:
+            break
+    return float(theta)
+
+
+def recommend_adaptive_questions(
+    df: pd.DataFrame,
+    attempts: pd.DataFrame,
+    theta: float,
+    limit: int = 10,
+    low_conf_threshold: int = 70,
+) -> pd.DataFrame:
+    candidates = df.copy()
+    candidates["difficulty"] = candidates["difficulty"].fillna(DIFFICULTY_DEFAULT)
+    candidates["difficulty_scaled"] = (candidates["difficulty"].astype(float) - 3.0) * 0.7
+    candidates["priority"] = np.where(
+        candidates["difficulty_scaled"] >= theta,
+        candidates["difficulty_scaled"] - theta,
+        (theta - candidates["difficulty_scaled"]) * 1.5,
+    )
+    if not attempts.empty:
+        attempts["created_at"] = pd.to_datetime(attempts["created_at"])
+        last_attempts = attempts.sort_values("created_at").groupby("question_id").tail(1)
+        if "confidence" in last_attempts:
+            confidence_series = last_attempts["confidence"].fillna(0)
+        else:
+            confidence_series = pd.Series(0, index=last_attempts.index)
+        mastered_ids = last_attempts[
+            (last_attempts["is_correct"] == 1)
+            & (confidence_series >= low_conf_threshold)
+        ]["question_id"].tolist()
+        if mastered_ids:
+            candidates = candidates[~candidates["id"].isin(mastered_ids)]
+    ranked = candidates.sort_values(["priority", "difficulty"], ascending=[True, False])
+    return ranked.head(limit)
+
+
+def compute_tricky_vocab_heatmap(
+    attempts: pd.DataFrame, df: pd.DataFrame, top_n: int = 12
+) -> pd.DataFrame:
+    wrong = attempts[attempts["is_correct"] == 0]
+    if wrong.empty:
+        return pd.DataFrame()
+    merged = wrong.merge(
+        df[["id", "question", "category", "tags"]],
+        left_on="question_id",
+        right_on="id",
+        how="left",
+    )
+    records: List[Dict[str, object]] = []
+    pattern = re.compile(r"[一-龠ぁ-んァ-ンA-Za-z0-9]{2,}")
+    for _, row in merged.iterrows():
+        text = f"{row.get('question', '')} {row.get('tags', '')}"
+        words = {w for w in pattern.findall(str(text)) if len(w) >= 2}
+        for word in list(words)[:20]:
+            records.append({"word": word, "category": row.get("category", "未分類")})
+    if not records:
+        return pd.DataFrame()
+    freq = pd.DataFrame(records)
+    counts = freq.groupby(["word", "category"]).size().reset_index(name="count")
+    totals = counts.groupby("word")["count"].sum().reset_index(name="total")
+    top_words = totals.nlargest(top_n, "total")["word"]
+    heatmap_df = counts[counts["word"].isin(top_words)]
+    return heatmap_df
+
+
+def compute_most_improved_topic(attempts: pd.DataFrame, df: pd.DataFrame) -> Optional[Dict[str, object]]:
+    merged = attempts.merge(df[["id", "topic"]], left_on="question_id", right_on="id", how="left")
+    merged = merged.dropna(subset=["topic"])
+    if merged.empty:
+        return None
+    improvements: List[Dict[str, object]] = []
+    for topic, group in merged.groupby("topic"):
+        if len(group) < 4:
+            continue
+        group = group.sort_values("created_at")
+        window = max(1, len(group) // 3)
+        early = group.head(window)["is_correct"].mean()
+        late = group.tail(window)["is_correct"].mean()
+        improvements.append(
+            {
+                "topic": topic,
+                "delta": late - early,
+                "early": early,
+                "late": late,
+                "attempts": len(group),
+            }
+        )
+    if not improvements:
+        return None
+    best = max(improvements, key=lambda x: x["delta"])
+    if best["delta"] <= 0:
+        return None
+    return best
+
+
 def register_keyboard_shortcuts(mapping: Dict[str, str]) -> None:
     if not mapping:
         return
@@ -909,6 +1285,9 @@ def init_session_state() -> None:
             "theme": "ライト",
             "timer": True,
             "sm2_initial_ease": 2.5,
+            "auto_advance": False,
+            "review_low_confidence_threshold": 60,
+            "review_elapsed_days": 7,
         },
     }
     for key, value in defaults.items():
@@ -922,8 +1301,15 @@ def main() -> None:
     engine = get_engine()
     db = DBManager(engine)
     db.initialize_from_csv()
+    df = load_questions_df()
 
     st.sidebar.title("宅建10年ドリル")
+    search_query = st.sidebar.text_input(
+        "🔍 横断検索",
+        value=st.session_state.get("global_search_query", ""),
+        placeholder="抵当権 代価弁済 / 再建築不可 など",
+    )
+    st.session_state["global_search_query"] = search_query
     nav = st.sidebar.radio(
         "メニュー",
         ["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"],
@@ -931,25 +1317,28 @@ def main() -> None:
     )
     st.session_state["nav"] = nav
 
+    if search_query:
+        render_global_search_panel(db, df, search_query)
+        st.divider()
+
     if nav == "ホーム":
-        render_home(db)
+        render_home(db, df)
     elif nav == "学習モード":
-        render_learning(db)
+        render_learning(db, df)
     elif nav == "模試":
-        render_mock_exam(db)
+        render_mock_exam(db, df)
     elif nav == "弱点復習":
         render_srs(db)
     elif nav == "統計":
-        render_stats(db)
+        render_stats(db, df)
     elif nav == "データ入出力":
         render_data_io(db)
     elif nav == "設定":
         render_settings()
 
 
-def render_home(db: DBManager) -> None:
+def render_home(db: DBManager, df: pd.DataFrame) -> None:
     st.title("ホーム")
-    df = load_questions_df()
     attempts = db.get_attempt_stats()
     st.markdown("### サマリー")
     col1, col2, col3 = st.columns(3)
@@ -970,20 +1359,21 @@ def render_home(db: DBManager) -> None:
         st.dataframe(logs)
 
 
-def render_learning(db: DBManager) -> None:
+def render_learning(db: DBManager, df: pd.DataFrame) -> None:
     st.title("学習モード")
-    df = load_questions_df()
     if df.empty:
         st.warning("設問データがありません。『データ入出力』からアップロードしてください。")
         return
-    tabs = st.tabs(["本試験モード", "分野別ドリル", "年度別演習", "弱点克服モード"])
+    tabs = st.tabs(["本試験モード", "適応学習", "分野別ドリル", "年度別演習", "弱点克服モード"])
     with tabs[0]:
         render_full_exam_lane(db, df)
     with tabs[1]:
-        render_subject_drill_lane(db, df)
+        render_adaptive_lane(db, df)
     with tabs[2]:
-        render_year_drill_lane(db, df)
+        render_subject_drill_lane(db, df)
     with tabs[3]:
+        render_year_drill_lane(db, df)
+    with tabs[4]:
         render_weakness_lane(db, df)
 
 
@@ -1018,6 +1408,45 @@ def render_full_exam_lane(db: DBManager, df: pd.DataFrame) -> None:
         display_exam_result(result)
 
 
+def render_adaptive_lane(db: DBManager, df: pd.DataFrame) -> None:
+    st.subheader("適応学習")
+    st.caption("回答履歴から能力θを推定し、伸びしろの大きい難度を優先出題します。")
+    attempts = db.get_attempt_stats()
+    if attempts.empty:
+        st.info("学習履歴がまだありません。本試験モードやドリルで取り組んでみましょう。")
+        return
+    theta = estimate_theta(attempts, df)
+    if theta is None:
+        st.info("推定に必要な難易度データが不足しています。問題に難易度を設定してください。")
+        return
+    st.metric("推定能力θ", f"{theta:.2f}")
+    low_conf = int(st.session_state["settings"].get("review_low_confidence_threshold", 60))
+    recommended = recommend_adaptive_questions(df, attempts, theta, low_conf_threshold=low_conf)
+    if recommended.empty:
+        st.info("おすすめできる問題がありません。条件を見直すか、新しい問題を追加してください。")
+        return
+    st.markdown("#### 推奨問題リスト (上位10件)")
+    display = recommended[["id", "year", "q_no", "category", "difficulty", "priority"]].rename(
+        columns={
+            "id": "問題ID",
+            "year": "年度",
+            "q_no": "問番",
+            "category": "分野",
+            "difficulty": "難易度",
+            "priority": "推奨度",
+        }
+    )
+    st.dataframe(display.set_index("問題ID"), use_container_width=True)
+    selected_id = st.selectbox(
+        "取り組む問題",
+        recommended["id"],
+        format_func=lambda x: format_question_label(df, x),
+        key="adaptive_question_select",
+    )
+    row = df[df["id"] == selected_id].iloc[0]
+    render_question_interaction(db, row, attempt_mode="adaptive", key_prefix="adaptive")
+
+
 def render_subject_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
     st.subheader("分野別ドリル")
     st.caption("民法・借地借家法・都市計画法・建築基準法・税・鑑定評価・宅建業法といったテーマをピンポイントで鍛えます。")
@@ -1037,6 +1466,11 @@ def render_subject_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
         )
         difficulties = st.slider("難易度", 1, 5, (1, 5), key="subject_difficulty")
         keyword = st.text_input("キーワードで絞り込み (問題文/タグ)", key="subject_keyword")
+        review_only = st.checkbox(
+            "復習だけ表示 (誤答・低確信・経過日数)",
+            value=st.session_state.get("subject_review_only", False),
+            key="subject_review_only",
+        )
     filtered = df[
         df["category"].isin(categories)
         & df["difficulty"].between(difficulties[0], difficulties[1])
@@ -1049,6 +1483,12 @@ def render_subject_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
             filtered["question"].str.lower().str.contains(keyword_lower)
             | filtered["tags"].fillna("").str.lower().str.contains(keyword_lower)
         ]
+    if review_only:
+        review_ids = get_review_candidate_ids(db)
+        if not review_ids:
+            st.info("復習対象の問題はありません。学習履歴を増やしてみましょう。")
+            return
+        filtered = filtered[filtered["id"].isin(review_ids)]
     if filtered.empty:
         st.warning("条件に合致する問題がありません。フィルタを調整してください。")
         return
@@ -1272,6 +1712,8 @@ def evaluate_exam_attempt(
             seconds=int(avg_seconds),
             mode=session.mode,
             exam_id=exam_id,
+            confidence=None,
+            grade=None,
         )
     accuracy = correct / max(total_questions, 1)
     remaining_time = max(0, 120 * 60 - int(duration))
@@ -1420,7 +1862,7 @@ def render_question_interaction(
                     st.session_state[selected_key] = actual_idx
                     selected_choice = actual_idx
                 st.markdown("</div>", unsafe_allow_html=True)
-    st.caption("1〜4キーで選択肢を即答できます。E:解説 F:フラグ N/P:移動 H:ヘルプ")
+    st.caption("1〜4キーで選択肢を即答できます。E:解説 F:フラグ N/P:移動 H:ヘルプ R:SRSリセット")
     confidence_value = st.session_state.get(confidence_key)
     if confidence_value is None:
         confidence_value = 50
@@ -1439,7 +1881,8 @@ def render_question_interaction(
     explanation_label = "解説を隠す" if show_explanation else "解説を表示"
     flag_label = "フラグ解除" if flagged else "復習フラグ"
     help_label = "ヘルプ"
-    action_cols = st.columns(4)
+    auto_advance_enabled = st.session_state["settings"].get("auto_advance", False)
+    action_cols = st.columns(5)
     with action_cols[0]:
         grade_clicked = st.button(
             grade_label,
@@ -1479,6 +1922,26 @@ def render_question_interaction(
             st.session_state[help_state_key] = help_visible
         else:
             help_visible = st.session_state.get(help_state_key, False)
+    with action_cols[4]:
+        if st.button(
+            "SRSリセット",
+            key=f"{key_prefix}_srs_reset_{row['id']}",
+            use_container_width=True,
+        ):
+            db.upsert_srs(
+                row["id"],
+                {
+                    "repetition": 0,
+                    "interval": 1,
+                    "ease": st.session_state["settings"].get("sm2_initial_ease", 2.5),
+                    "due_date": dt.date.today(),
+                    "last_grade": None,
+                    "updated_at": dt.datetime.now(),
+                },
+            )
+            st.success("SRSを初期化しました。明日から復習に再投入されます。")
+    if auto_advance_enabled and navigation and navigation.has_next:
+        st.caption("採点後0.8秒で次問に自動遷移します。")
     if flagged:
         st.caption("この問題は復習フラグが設定されています。")
     feedback = st.session_state.get(feedback_key)
@@ -1492,13 +1955,6 @@ def render_question_interaction(
             else:
                 correct_choice = int(correct_choice)
                 is_correct = (selected_choice + 1) == correct_choice
-                db.record_attempt(
-                    row["id"],
-                    selected_choice + 1,
-                    is_correct,
-                    seconds=0,
-                    mode=attempt_mode,
-                )
                 initial_ease = st.session_state["settings"].get("sm2_initial_ease", 2.5)
                 srs_row = db.fetch_srs(row["id"])
                 grade_value = confidence_to_grade(is_correct, confidence_value)
@@ -1528,6 +1984,24 @@ def render_question_interaction(
                     "grade": grade_value,
                 }
                 feedback = st.session_state[feedback_key]
+                db.record_attempt(
+                    row["id"],
+                    selected_choice + 1,
+                    is_correct,
+                    seconds=0,
+                    mode=attempt_mode,
+                    confidence=confidence_value,
+                    grade=grade_value,
+                )
+                if (
+                    auto_advance_enabled
+                    and navigation is not None
+                    and navigation.has_next
+                    and navigation.on_next is not None
+                ):
+                    time.sleep(0.8)
+                    navigation.on_next()
+                    st.experimental_rerun()
     if feedback and feedback.get("question_id") == row["id"]:
         correct_msg = choice_labels[feedback["correct_choice"] - 1]
         message = "正解です！" if feedback["is_correct"] else f"不正解。正答は {correct_msg}"
@@ -1537,11 +2011,7 @@ def render_question_interaction(
         )
     if show_explanation:
         st.markdown("#### 解説")
-        st.write(row.get("explanation", "解説が未登録です。"))
-        similar = compute_similarity(row["id"])
-        if not similar.empty:
-            st.markdown("#### 類似問題")
-            st.dataframe(similar)
+        render_explanation_content(row)
     if help_visible:
         st.info(
             """ショートカット一覧\n- 1〜4: 選択肢を選ぶ\n- E: 解説の表示/非表示\n- F: 復習フラグの切り替え\n- N/P: 次へ・前へ\n- H: このヘルプ"""
@@ -1578,6 +2048,7 @@ def render_question_interaction(
     shortcut_map["e"] = explanation_label
     shortcut_map["f"] = flag_label
     shortcut_map["h"] = help_label
+    shortcut_map["r"] = "SRSリセット"
     if navigation:
         shortcut_map["n"] = nav_next_label
         shortcut_map["p"] = nav_prev_label
@@ -1598,9 +2069,8 @@ def render_law_reference(row: pd.Series) -> None:
         st.caption(LAW_BASELINE_LABEL)
 
 
-def render_mock_exam(db: DBManager) -> None:
+def render_mock_exam(db: DBManager, df: pd.DataFrame) -> None:
     st.title("模試")
-    df = load_questions_df()
     if df.empty:
         st.warning("設問データがありません。")
         return
@@ -1652,28 +2122,116 @@ def render_srs(db: DBManager) -> None:
             st.success("SRSを更新しました")
 
 
-def render_stats(db: DBManager) -> None:
-    st.title("統計")
+def render_stats(db: DBManager, df: pd.DataFrame) -> None:
+    st.title("分析ダッシュボード")
     attempts = db.get_attempt_stats()
     if attempts.empty:
         st.info("統計情報はまだありません。学習を開始しましょう。")
         return
-    attempts["date"] = pd.to_datetime(attempts["created_at"]).dt.date
-    attempts_group = attempts.groupby("date")["is_correct"].mean().reset_index()
-    chart = altair_chart(attempts_group, "date", "is_correct", "日次正答率")
-    st.altair_chart(chart, use_container_width=True)
-    cat_group = attempts.groupby("category")["is_correct"].mean().reset_index()
-    chart2 = altair_chart(cat_group, "category", "is_correct", "分野別正答率", mark="bar")
-    st.altair_chart(chart2, use_container_width=True)
+    attempts["created_at"] = pd.to_datetime(attempts["created_at"])
+    attempts["seconds"] = pd.to_numeric(attempts.get("seconds"), errors="coerce")
+    attempts["confidence"] = pd.to_numeric(attempts.get("confidence"), errors="coerce")
+    merged = attempts.merge(
+        df[["id", "question", "category", "topic", "tags", "difficulty"]],
+        left_on="question_id",
+        right_on="id",
+        how="left",
+    )
+    accuracy = merged["is_correct"].mean()
+    avg_seconds = merged["seconds"].mean()
+    avg_confidence = merged["confidence"].mean()
+    st.subheader("サマリー")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("挑戦回数", f"{len(merged)} 回")
+    with col2:
+        st.metric("平均正答率", f"{accuracy * 100:.1f}%")
+    with col3:
+        st.metric("平均解答時間", f"{avg_seconds:.1f} 秒" if not np.isnan(avg_seconds) else "--")
+    if not np.isnan(avg_confidence):
+        st.caption(f"平均確信度: {avg_confidence:.1f}%")
 
-
-def altair_chart(df: pd.DataFrame, x: str, y: str, title: str, mark: str = "line"):
     import altair as alt
 
-    chart = getattr(alt.Chart(df), mark)().encode(x=x, y=y).properties(title=title)
-    return chart
+    st.subheader("分野別分析")
+    category_stats = (
+        merged.groupby("category")
+        .agg(
+            accuracy=("is_correct", "mean"),
+            avg_seconds=("seconds", "mean"),
+            attempts_count=("is_correct", "count"),
+        )
+        .reset_index()
+    )
+    accuracy_chart = (
+        alt.Chart(category_stats)
+        .mark_bar()
+        .encode(
+            x=alt.X("category", title="分野"),
+            y=alt.Y("accuracy", title="正答率", axis=alt.Axis(format="%")),
+            tooltip=["category", alt.Tooltip("accuracy", format=".2%"), "attempts_count"],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(accuracy_chart, use_container_width=True)
+    time_chart = (
+        alt.Chart(category_stats)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("category", title="分野"),
+            y=alt.Y("avg_seconds", title="平均解答時間 (秒)", scale=alt.Scale(zero=False)),
+            tooltip=["category", alt.Tooltip("avg_seconds", format=".1f"), "attempts_count"],
+        )
+    )
+    st.altair_chart(time_chart, use_container_width=True)
 
+    st.subheader("確信度と正答の相関")
+    valid_conf = merged.dropna(subset=["confidence"])
+    if valid_conf.empty:
+        st.info("確信度データがまだありません。学習時にスライダーで自己評価してみましょう。")
+    else:
+        corr = valid_conf["confidence"].corr(valid_conf["is_correct"])
+        st.metric("相関係数", f"{corr:.2f}")
+        scatter = (
+            alt.Chart(valid_conf)
+            .mark_circle(opacity=0.6)
+            .encode(
+                x=alt.X("confidence", title="確信度 (%)"),
+                y=alt.Y("is_correct", title="正答 (1=正解)", scale=alt.Scale(domain=[-0.1, 1.1])),
+                color=alt.Color("category", legend=None),
+                tooltip=["category", "topic", "confidence", "is_correct", "seconds"],
+            )
+        )
+        st.altair_chart(scatter, use_container_width=True)
 
+    st.subheader("ひっかけ語彙ヒートマップ")
+    heatmap_df = compute_tricky_vocab_heatmap(merged, df)
+    if heatmap_df.empty:
+        st.info("誤答語彙のデータがまだ十分ではありません。")
+    else:
+        word_order = (
+            heatmap_df.groupby("word")["count"].sum().sort_values(ascending=False).index.tolist()
+        )
+        heatmap = (
+            alt.Chart(heatmap_df)
+            .mark_rect()
+            .encode(
+                x=alt.X("category", title="分野"),
+                y=alt.Y("word", title="語彙", sort=word_order),
+                color=alt.Color("count", title="誤答回数", scale=alt.Scale(scheme="reds")),
+                tooltip=["word", "category", "count"],
+            )
+        )
+        st.altair_chart(heatmap, use_container_width=True)
+
+    st.subheader("最も改善した論点")
+    improvement = compute_most_improved_topic(merged, df)
+    if improvement:
+        st.success(
+            f"{improvement['topic']}：正答率が {(improvement['early'] * 100):.1f}% → {(improvement['late'] * 100):.1f}% (＋{improvement['delta'] * 100:.1f}ポイント)"
+        )
+    else:
+        st.info("改善の傾向を示す論点はまだ検出されていません。継続して学習しましょう。")
 def render_data_io(db: DBManager) -> None:
     st.title("データ入出力")
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1685,6 +2243,110 @@ def render_data_io(db: DBManager) -> None:
         mime="application/zip",
     )
     st.caption("設問・正答データのCSV/XLSXテンプレートが含まれます。必要に応じて編集してご利用ください。")
+    st.markdown("### クイックインポート (questions.csv / answers.csv)")
+    quick_cols = st.columns(2)
+    with quick_cols[0]:
+        quick_questions_file = st.file_uploader(
+            "questions.csv をアップロード",
+            type=["csv"],
+            key="quick_questions_file",
+        )
+    with quick_cols[1]:
+        quick_answers_file = st.file_uploader(
+            "answers.csv をアップロード",
+            type=["csv"],
+            key="quick_answers_file",
+        )
+    if st.button("クイックインポート実行", key="quick_import_button"):
+        quick_errors: List[str] = []
+        questions_df: Optional[pd.DataFrame] = None
+        answers_df: Optional[pd.DataFrame] = None
+        if quick_questions_file is None and quick_answers_file is None:
+            st.warning("questions.csv か answers.csv のいずれかを選択してください。")
+        else:
+            if quick_questions_file is not None:
+                data = quick_questions_file.getvalue()
+                try:
+                    questions_df = pd.read_csv(io.BytesIO(data))
+                except UnicodeDecodeError:
+                    questions_df = pd.read_csv(io.BytesIO(data), encoding="cp932")
+                quick_errors.extend(validate_question_records(questions_df))
+            if quick_answers_file is not None:
+                data = quick_answers_file.getvalue()
+                try:
+                    answers_df = pd.read_csv(io.BytesIO(data))
+                except UnicodeDecodeError:
+                    answers_df = pd.read_csv(io.BytesIO(data), encoding="cp932")
+                quick_errors.extend(validate_answer_records(answers_df))
+            if quick_errors:
+                for err in quick_errors:
+                    st.error(err)
+            else:
+                policy = {"explanation": "overwrite", "tags": "merge"}
+                merged_df: Optional[pd.DataFrame] = None
+                rejects_q = pd.DataFrame()
+                rejects_a = pd.DataFrame()
+                conflicts = pd.DataFrame()
+                if questions_df is not None:
+                    normalized_q = normalize_questions(questions_df)
+                else:
+                    normalized_q = None
+                if answers_df is not None:
+                    normalized_a = normalize_answers(answers_df)
+                else:
+                    normalized_a = None
+                if normalized_q is not None and normalized_a is not None:
+                    merged_df, rejects_q, rejects_a, conflicts = merge_questions_answers(
+                        normalized_q, normalized_a, policy=policy
+                    )
+                elif normalized_q is not None:
+                    merged_df = normalized_q
+                elif normalized_a is not None:
+                    existing = load_questions_df()
+                    if existing.empty:
+                        st.error("設問データが存在しません。answers.csv を取り込む前に questions.csv を読み込んでください。")
+                    else:
+                        merged_df, rejects_q, rejects_a, conflicts = merge_questions_answers(
+                            existing, normalized_a, policy=policy
+                        )
+                if merged_df is not None:
+                    inserted, updated = db.upsert_questions(merged_df)
+                    rebuild_tfidf_cache()
+                    st.success(f"クイックインポートが完了しました。追加 {inserted} 件 / 更新 {updated} 件")
+                    if not rejects_q.empty or not rejects_a.empty:
+                        st.warning(
+                            f"取り込めなかったレコードがあります。questions: {len(rejects_q)} 件 / answers: {len(rejects_a)} 件"
+                        )
+                    if not conflicts.empty:
+                        st.info(f"正答の衝突が {len(conflicts)} 件あり、上書きしました。")
+    st.markdown("### クイックエクスポート (questions.csv / answers.csv)")
+    existing_questions = load_questions_df()
+    if existing_questions.empty:
+        st.info("エクスポート可能な設問データがありません。")
+    else:
+        question_cols = QUESTION_TEMPLATE_COLUMNS.copy()
+        if "id" in existing_questions.columns and "id" not in question_cols:
+            question_cols.append("id")
+        q_export = existing_questions[question_cols]
+        q_buffer = io.StringIO()
+        q_export.to_csv(q_buffer, index=False)
+        st.download_button(
+            "questions.csv をダウンロード",
+            q_buffer.getvalue(),
+            file_name="questions.csv",
+            mime="text/csv",
+            key="export_questions_csv",
+        )
+        answers_export = build_answers_export(existing_questions)
+        a_buffer = io.StringIO()
+        answers_export.to_csv(a_buffer, index=False)
+        st.download_button(
+            "answers.csv をダウンロード",
+            a_buffer.getvalue(),
+            file_name="answers.csv",
+            mime="text/csv",
+            key="export_answers_csv",
+        )
     st.markdown("### (1) ファイル選択")
     uploaded_files = st.file_uploader(
         "設問・解答ファイルを選択 (CSV/XLSX/ZIP)",
@@ -1938,6 +2600,22 @@ def render_settings() -> None:
     settings["shuffle_choices"] = st.checkbox("選択肢をシャッフル", value=settings.get("shuffle_choices", True))
     settings["timer"] = st.checkbox("タイマーを表示", value=settings.get("timer", True))
     settings["sm2_initial_ease"] = st.slider("SM-2初期ease", 1.3, 3.0, settings.get("sm2_initial_ease", 2.5))
+    settings["auto_advance"] = st.checkbox(
+        "採点後に自動で次問へ進む (0.8秒遅延)",
+        value=settings.get("auto_advance", False),
+    )
+    settings["review_low_confidence_threshold"] = st.slider(
+        "低確信として扱う確信度 (%)",
+        0,
+        100,
+        int(settings.get("review_low_confidence_threshold", 60)),
+    )
+    settings["review_elapsed_days"] = st.slider(
+        "復習抽出の経過日数しきい値",
+        1,
+        30,
+        int(settings.get("review_elapsed_days", 7)),
+    )
     if st.button("TF-IDFを再学習"):
         rebuild_tfidf_cache()
         st.success("TF-IDFを再学習しました")
