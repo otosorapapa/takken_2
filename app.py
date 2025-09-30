@@ -2262,10 +2262,21 @@ def main() -> None:
     sidebar.title("宅建10年ドリル")
     if st.session_state.get("_nav_widget") != st.session_state.get("nav"):
         st.session_state["_nav_widget"] = st.session_state.get("nav", "ホーム")
+    menu_options = [
+        "ホーム",
+        "学習モード",
+        "法改正対策",
+        "予想問題演習",
+        "模試",
+        "弱点復習",
+        "統計",
+        "データ入出力",
+        "設定",
+    ]
     sidebar.radio(
         "メニュー",
-        ["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"],
-        index=["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"].index(
+        menu_options,
+        index=menu_options.index(
             st.session_state.get("nav", "ホーム")
         ),
         key="_nav_widget",
@@ -2326,6 +2337,8 @@ def main() -> None:
                 [
                     "- **ホーム**：進捗サマリーと最近のインポート履歴を確認できます。",
                     "- **学習モード**：目的別タブから本試験演習やドリル、適応学習を選択します。",
+                    "- **法改正対策**：最新の改正論点に特化した問題演習を行えます。",
+                    "- **予想問題演習**：アップロードした直前対策用の予想問題を解きます。",
                     "- **模試**：年度や出題方式を指定して本番同様の模試を開始します。",
                     "- **弱点復習**：SRSの期限が来た問題をまとめて復習します。",
                     "- **統計**：分野別の成績や時間分析を把握できます。",
@@ -2343,6 +2356,10 @@ def main() -> None:
         render_home(db, df)
     elif nav == "学習モード":
         render_learning(db, df)
+    elif nav == "法改正対策":
+        render_law_revision_lane(db)
+    elif nav == "予想問題演習":
+        render_predicted_lane(db)
     elif nav == "模試":
         render_mock_exam(db, df)
     elif nav == "弱点復習":
