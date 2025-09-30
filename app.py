@@ -20,7 +20,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sqlalchemy import (JSON, Column, Date, DateTime, Float, Integer, MetaData,
                         String, Table, UniqueConstraint, create_engine, func,
-                        select)
+                        select, tuple_)
 from sqlalchemy import inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
@@ -261,32 +261,66 @@ class DBManager:
     def upsert_questions(self, df: pd.DataFrame) -> Tuple[int, int]:
         records = df.to_dict(orient="records")
         ids = [rec["id"] for rec in records if "id" in rec]
+        year_qno_pairs = {
+            (rec["year"], rec["q_no"]) for rec in records if "year" in rec and "q_no" in rec
+        }
         inserted = 0
         updated = 0
         with self.engine.begin() as conn:
             if ids:
-                existing = set(
+                existing_ids: Set[str] = set(
                     conn.execute(
                         select(questions_table.c.id).where(questions_table.c.id.in_(ids))
                     ).scalars()
                 )
             else:
-                existing = set()
+                existing_ids = set()
+
+            if year_qno_pairs:
+                existing_pairs = {
+                    (row.year, row.q_no): row.id
+                    for row in conn.execute(
+                        select(
+                            questions_table.c.year,
+                            questions_table.c.q_no,
+                            questions_table.c.id,
+                        ).where(
+                            tuple_(questions_table.c.year, questions_table.c.q_no).in_(
+                                list(year_qno_pairs)
+                            )
+                        )
+                    )
+                }
+            else:
+                existing_pairs = {}
+
             for rec in records:
-                stmt = sqlite_insert(questions_table).values(**rec)
-                do_update_stmt = stmt.on_conflict_do_update(
-                    index_elements=[questions_table.c.id],
-                    set_={
-                        col.name: getattr(stmt.excluded, col.name)
-                        for col in questions_table.columns
-                        if col.name not in ("id",)
-                    },
-                )
-                conn.execute(do_update_stmt)
-                if rec["id"] in existing:
+                rec_id = rec.get("id")
+                year_qno = (rec.get("year"), rec.get("q_no"))
+                update_values = {k: v for k, v in rec.items() if k != "id"}
+
+                if rec_id in existing_ids:
+                    conn.execute(
+                        update(questions_table)
+                        .where(questions_table.c.id == rec_id)
+                        .values(**update_values)
+                    )
+                    updated += 1
+                elif year_qno in existing_pairs:
+                    existing_id = existing_pairs[year_qno]
+                    conn.execute(
+                        update(questions_table)
+                        .where(questions_table.c.id == existing_id)
+                        .values(**update_values)
+                    )
                     updated += 1
                 else:
+                    conn.execute(sa_insert(questions_table).values(**rec))
                     inserted += 1
+                    if rec_id:
+                        existing_ids.add(rec_id)
+                    if None not in year_qno:
+                        existing_pairs[year_qno] = rec_id
         return inserted, updated
 
     def fetch_question(self, question_id: str) -> Optional[pd.Series]:
