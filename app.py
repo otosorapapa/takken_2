@@ -1421,7 +1421,11 @@ def render_question_interaction(
                     selected_choice = actual_idx
                 st.markdown("</div>", unsafe_allow_html=True)
     st.caption("1〜4キーで選択肢を即答できます。E:解説 F:フラグ N/P:移動 H:ヘルプ")
-    confidence_value = st.session_state.get(confidence_key, 50)
+    confidence_value = st.session_state.get(confidence_key)
+    if confidence_value is None:
+        confidence_value = 50
+    else:
+        confidence_value = int(confidence_value)
     confidence_value = st.slider(
         "確信度（ぜんぜん自信なし ↔ 完璧）",
         0,
@@ -1429,7 +1433,6 @@ def render_question_interaction(
         value=confidence_value,
         key=confidence_key,
     )
-    st.session_state[confidence_key] = confidence_value
     show_explanation = st.session_state.get(explanation_key, False)
     flagged = row["id"] in set(st.session_state.get("review_flags", []))
     grade_label = "採点"
