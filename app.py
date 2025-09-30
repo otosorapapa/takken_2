@@ -1492,6 +1492,20 @@ def render_explanation_content(row: pd.Series) -> None:
         if not similar.empty:
             st.markdown("#### 類似問題")
             st.dataframe(similar, use_container_width=True)
+            questions_df = load_questions_df()
+            similar_ids = [qid for qid in similar["id"] if pd.notna(qid)]
+            if similar_ids:
+                selected_similar_id = st.selectbox(
+                    "類似問題をプレビュー",
+                    similar_ids,
+                    format_func=lambda x: format_question_label(questions_df, x),
+                    key=f"similar_preview_{row['id']}",
+                )
+                preview_row = questions_df[questions_df["id"] == selected_similar_id]
+                if preview_row.empty:
+                    st.info("選択した問題がデータベースに見つかりません。")
+                else:
+                    render_question_preview(preview_row.iloc[0])
 
 
 def estimate_theta(attempts: pd.DataFrame, df: pd.DataFrame) -> Optional[float]:
@@ -2695,8 +2709,36 @@ def render_question_interaction(
     register_keyboard_shortcuts(shortcut_map)
 
 def format_question_label(df: pd.DataFrame, question_id: str) -> str:
-    row = df[df["id"] == question_id].iloc[0]
-    return f"{row['year']}年 問{row['q_no']} ({row['category']})"
+    if df.empty:
+        return str(question_id)
+    matches = df[df["id"] == question_id]
+    if matches.empty:
+        return f"未登録の問題 ({question_id})"
+    row = matches.iloc[0]
+    year_value = row.get("year")
+    if pd.isna(year_value):
+        year_display = "?"
+    elif isinstance(year_value, (int, np.integer)):
+        year_display = int(year_value)
+    elif isinstance(year_value, float):
+        year_display = int(year_value)
+    else:
+        year_display = year_value
+    q_no_value = row.get("q_no")
+    if pd.isna(q_no_value):
+        q_no_display = "?"
+    elif isinstance(q_no_value, (int, np.integer)):
+        q_no_display = int(q_no_value)
+    elif isinstance(q_no_value, float):
+        q_no_display = int(q_no_value)
+    else:
+        q_no_display = q_no_value
+    category_value = row.get("category")
+    if pd.isna(category_value):
+        category_display = "不明"
+    else:
+        category_display = str(category_value).strip() or "不明"
+    return f"{year_display}年 問{q_no_display} ({category_display})"
 
 
 def render_law_reference(row: pd.Series) -> None:
@@ -2707,6 +2749,23 @@ def render_law_reference(row: pd.Series) -> None:
         st.caption(f"{LAW_BASELINE_LABEL} ｜ [条文検索]({url})")
     else:
         st.caption(LAW_BASELINE_LABEL)
+
+
+def render_question_preview(row: pd.Series) -> None:
+    render_law_reference(row)
+    question_text = row.get("question", "")
+    if pd.isna(question_text):
+        question_text = ""
+    st.markdown(str(question_text), unsafe_allow_html=True)
+    choice_labels = ["①", "②", "③", "④"]
+    for idx, label in enumerate(choice_labels, start=1):
+        choice_text = row.get(f"choice{idx}")
+        if pd.isna(choice_text):
+            continue
+        choice_text = str(choice_text)
+        if not choice_text.strip():
+            continue
+        st.markdown(f"{label} {choice_text}", unsafe_allow_html=True)
 
 
 def render_mock_exam(db: DBManager, df: pd.DataFrame) -> None:
