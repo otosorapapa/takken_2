@@ -1701,6 +1701,15 @@ def main() -> None:
 
     sidebar = st.sidebar
     sidebar.title("宅建10年ドリル")
+    nav = sidebar.radio(
+        "メニュー",
+        ["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"],
+        index=["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"].index(
+            st.session_state.get("nav", "ホーム")
+        ),
+    )
+    st.session_state["nav"] = nav
+    sidebar.divider()
     sidebar.text_input(
         "🔍 横断検索",
         key="global_search_input",
@@ -1739,13 +1748,6 @@ def main() -> None:
                 set_global_search_query(keyword)
                 search_query = keyword
                 safe_rerun()
-    sidebar.divider()
-    nav = sidebar.radio(
-        "メニュー",
-        ["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"],
-        index=["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"].index(st.session_state.get("nav", "ホーム")),
-    )
-    st.session_state["nav"] = nav
     with sidebar.expander("モード別の使い方ガイド", expanded=False):
         st.markdown(
             "\n".join(
