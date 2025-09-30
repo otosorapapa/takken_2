@@ -3384,6 +3384,7 @@ def render_question_interaction(
                 ):
                     st.session_state[selected_key] = actual_idx
                     selected_choice = actual_idx
+                    st.experimental_rerun()
                 st.markdown("</div>", unsafe_allow_html=True)
     st.caption("1〜4キーで選択肢を即答できます。E:解説 F:フラグ N/P:移動 H:ヘルプ R:SRSリセット")
     confidence_value = st.session_state.get(confidence_key)
