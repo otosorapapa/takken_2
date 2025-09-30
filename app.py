@@ -1132,6 +1132,12 @@ def inject_ui_styles() -> None:
 .takken-inline-actions button {
     min-height: 48px;
 }
+[data-testid="stMarkdownContainer"] {
+    text-align: left;
+}
+[data-testid="stMarkdownContainer"] * {
+    text-align: left !important;
+}
 """,
         "takken-ui-styles",
     )
