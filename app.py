@@ -803,6 +803,7 @@ def render_learning(db: DBManager) -> None:
     row = filtered[filtered["id"] == question_id].iloc[0]
     st.subheader(f"{row['year']}年 問{row['q_no']}")
     st.markdown(f"**{row['category']} / {row['topic']}**")
+    st.markdown(row["question"], unsafe_allow_html=True)
     choices = [row[f"choice{i}"] for i in range(1, 5)]
     if st.session_state["settings"].get("shuffle_choices", True):
         random.seed(question_id)
