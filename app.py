@@ -49,6 +49,36 @@ DIFFICULTY_DEFAULT = 3
 LAW_BASELINE_LABEL = "適用法令基準日（R6/4/1）"
 LAW_REFERENCE_BASE_URL = "https://elaws.e-gov.go.jp/search?q={query}"
 
+GLOBAL_SEARCH_SUGGESTIONS = [
+    "重要事項説明",
+    "抵当権",
+    "都市計画法",
+    "宅建業免許",
+    "宅地建物取引士",
+    "瑕疵担保",
+]
+
+SUBJECT_PRESETS = {
+    "バランスよく10問": {
+        "categories": CATEGORY_CHOICES,
+        "difficulty": (1, 5),
+        "review_only": False,
+        "topics": [],
+    },
+    "民法・権利関係を集中演習": {
+        "categories": ["権利関係"],
+        "difficulty": (2, 5),
+        "review_only": False,
+        "topics": [],
+    },
+    "弱点復習に集中": {
+        "categories": CATEGORY_CHOICES,
+        "difficulty": (1, 4),
+        "review_only": True,
+        "topics": [],
+    },
+}
+
 metadata = MetaData()
 
 questions_table = Table(
@@ -154,6 +184,31 @@ def ensure_schema_migrations(engine: Engine) -> None:
             conn.execute(text("ALTER TABLE attempts ADD COLUMN confidence INTEGER"))
         if "grade" not in attempt_columns:
             conn.execute(text("ALTER TABLE attempts ADD COLUMN grade INTEGER"))
+
+
+def trigger_global_search() -> None:
+    query = str(st.session_state.get("global_search_input", "") or "").strip()
+    st.session_state["global_search_query"] = query
+    st.session_state["global_search_submitted"] = bool(query)
+
+
+def clear_global_search() -> None:
+    st.session_state["global_search_input"] = ""
+    st.session_state["global_search_query"] = ""
+    st.session_state["global_search_submitted"] = False
+
+
+def set_global_search_query(query: str) -> None:
+    st.session_state["global_search_input"] = query
+    st.session_state["global_search_query"] = query
+    st.session_state["global_search_submitted"] = bool(query)
+
+
+def safe_rerun() -> None:
+    try:
+        st.rerun()
+    except AttributeError:
+        st.experimental_rerun()
 
 
 QUESTION_TEMPLATE_COLUMNS = [
@@ -1314,6 +1369,9 @@ def init_session_state() -> None:
         "attempt_start": None,
         "exam_session": None,
         "import_state": {},
+        "global_search_input": "",
+        "global_search_query": "",
+        "global_search_submitted": False,
         "settings": {
             "shuffle_choices": True,
             "theme": "ライト",
@@ -1337,21 +1395,51 @@ def main() -> None:
     db.initialize_from_csv()
     df = load_questions_df()
 
-    st.sidebar.title("宅建10年ドリル")
-    search_query = st.sidebar.text_input(
+    sidebar = st.sidebar
+    sidebar.title("宅建10年ドリル")
+    sidebar.text_input(
         "🔍 横断検索",
-        value=st.session_state.get("global_search_query", ""),
+        key="global_search_input",
         placeholder="抵当権 代価弁済 / 再建築不可 など",
+        help="Enterキーまたは『検索』ボタンで実行します。",
+        on_change=trigger_global_search,
     )
-    st.session_state["global_search_query"] = search_query
-    nav = st.sidebar.radio(
+    search_action_cols = sidebar.columns(2)
+    if search_action_cols[0].button("検索", key="global_search_button"):
+        trigger_global_search()
+    if search_action_cols[1].button("条件クリア", key="global_search_clear", type="secondary"):
+        clear_global_search()
+    search_query = st.session_state.get("global_search_query", "")
+    with sidebar.expander("キーワードヒント", expanded=False):
+        st.caption("よく使う語句をクリックすると検索欄に自動入力されます。")
+        hint_cols = st.columns(2)
+        for idx, keyword in enumerate(GLOBAL_SEARCH_SUGGESTIONS):
+            if hint_cols[idx % 2].button(keyword, key=f"global_search_hint_{idx}"):
+                set_global_search_query(keyword)
+                search_query = keyword
+    sidebar.divider()
+    nav = sidebar.radio(
         "メニュー",
         ["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"],
         index=["ホーム", "学習モード", "模試", "弱点復習", "統計", "データ入出力", "設定"].index(st.session_state.get("nav", "ホーム")),
     )
     st.session_state["nav"] = nav
+    with sidebar.expander("モード別の使い方ガイド", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    "- **ホーム**：進捗サマリーと最近のインポート履歴を確認できます。",
+                    "- **学習モード**：目的別タブから本試験演習やドリル、適応学習を選択します。",
+                    "- **模試**：年度や出題方式を指定して本番同様の模試を開始します。",
+                    "- **弱点復習**：SRSの期限が来た問題をまとめて復習します。",
+                    "- **統計**：分野別の成績や時間分析を把握できます。",
+                    "- **データ入出力**：CSV/ZIPの取り込みや履歴エクスポートを行います。",
+                    "- **設定**：タイマーやシャッフルなど学習体験の好みを調整します。",
+                ]
+            )
+        )
 
-    if search_query:
+    if search_query and st.session_state.get("global_search_submitted"):
         render_global_search_panel(db, df, search_query)
         st.divider()
 
@@ -1485,6 +1573,20 @@ def render_subject_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
     st.subheader("分野別ドリル")
     st.caption("民法・借地借家法・都市計画法・建築基準法・税・鑑定評価・宅建業法といったテーマをピンポイントで鍛えます。")
     with st.expander("出題条件", expanded=True):
+        preset = st.selectbox(
+            "クイックプリセット",
+            list(SUBJECT_PRESETS.keys()),
+            help="代表的な絞り込み条件をワンクリックで適用できます。",
+            key="subject_preset",
+        )
+        if st.button("プリセットを適用", key="subject_apply_preset"):
+            config = SUBJECT_PRESETS[preset]
+            st.session_state["subject_categories"] = config["categories"]
+            st.session_state["subject_difficulty"] = config["difficulty"]
+            st.session_state["subject_review_only"] = config["review_only"]
+            st.session_state["subject_topics"] = config.get("topics", [])
+            st.session_state["subject_keyword"] = ""
+            safe_rerun()
         categories = st.multiselect(
             "分野",
             CATEGORY_CHOICES,
@@ -1498,8 +1600,19 @@ def render_subject_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
             default=[],
             key="subject_topics",
         )
-        difficulties = st.slider("難易度", 1, 5, (1, 5), key="subject_difficulty")
-        keyword = st.text_input("キーワードで絞り込み (問題文/タグ)", key="subject_keyword")
+        difficulties = st.slider(
+            "難易度",
+            1,
+            5,
+            (1, 5),
+            key="subject_difficulty",
+            help="1は易しい〜5は難しい問題です。",
+        )
+        keyword = st.text_input(
+            "キーワードで絞り込み (問題文/タグ)",
+            key="subject_keyword",
+            help="語句を入力すると問題文とタグから部分一致で検索します。",
+        )
         review_only = st.checkbox(
             "復習だけ表示 (誤答・低確信・経過日数)",
             value=st.session_state.get("subject_review_only", False),
@@ -1526,6 +1639,7 @@ def render_subject_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
     if filtered.empty:
         st.warning("条件に合致する問題がありません。フィルタを調整してください。")
         return
+    st.caption(f"現在の条件に合致する問題は {len(filtered)} 件です。")
     question_id = st.selectbox(
         "出題問題",
         filtered["id"],
@@ -2162,9 +2276,14 @@ def render_stats(db: DBManager, df: pd.DataFrame) -> None:
     if attempts.empty:
         st.info("統計情報はまだありません。学習を開始しましょう。")
         return
-    attempts["created_at"] = pd.to_datetime(attempts["created_at"])
-    attempts["seconds"] = pd.to_numeric(attempts.get("seconds"), errors="coerce")
-    attempts["confidence"] = pd.to_numeric(attempts.get("confidence"), errors="coerce")
+    try:
+        attempts["created_at"] = pd.to_datetime(attempts["created_at"])
+        attempts["seconds"] = pd.to_numeric(attempts.get("seconds"), errors="coerce")
+        attempts["confidence"] = pd.to_numeric(attempts.get("confidence"), errors="coerce")
+    except Exception as exc:
+        st.error(f"学習履歴の整形に失敗しました ({exc})")
+        st.info("CSVを直接編集した場合は、日付や秒数の列が数値・日時形式になっているか確認してください。")
+        return
     question_meta_cols = ["id", "question", "category", "topic", "tags", "difficulty"]
     merged = attempts.merge(
         df[question_meta_cols],
@@ -2181,6 +2300,10 @@ def render_stats(db: DBManager, df: pd.DataFrame) -> None:
             else:
                 merged[col] = merged[alt_col]
             merged = merged.drop(columns=[alt_col])
+    if merged.empty:
+        st.warning("集計対象の設問が特定できませんでした。設問データが削除されていないか確認してください。")
+        st.info("『データ入出力』でquestions.csvを再度取り込み、設問IDと学習履歴の対応を復元できます。")
+        return
     accuracy = merged["is_correct"].mean()
     avg_seconds = merged["seconds"].mean()
     avg_confidence = merged["confidence"].mean()
@@ -2207,27 +2330,30 @@ def render_stats(db: DBManager, df: pd.DataFrame) -> None:
         )
         .reset_index()
     )
-    accuracy_chart = (
-        alt.Chart(category_stats)
-        .mark_bar()
-        .encode(
-            x=alt.X("category", title="分野"),
-            y=alt.Y("accuracy", title="正答率", axis=alt.Axis(format="%")),
-            tooltip=["category", alt.Tooltip("accuracy", format=".2%"), "attempts_count"],
+    if category_stats.empty:
+        st.info("分野情報が未登録の設問が多いようです。questions.csv の category 列を確認してください。")
+    else:
+        accuracy_chart = (
+            alt.Chart(category_stats)
+            .mark_bar()
+            .encode(
+                x=alt.X("category", title="分野"),
+                y=alt.Y("accuracy", title="正答率", axis=alt.Axis(format="%")),
+                tooltip=["category", alt.Tooltip("accuracy", format=".2%"), "attempts_count"],
+            )
+            .properties(height=320)
         )
-        .properties(height=320)
-    )
-    st.altair_chart(accuracy_chart, use_container_width=True)
-    time_chart = (
-        alt.Chart(category_stats)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("category", title="分野"),
-            y=alt.Y("avg_seconds", title="平均解答時間 (秒)", scale=alt.Scale(zero=False)),
-            tooltip=["category", alt.Tooltip("avg_seconds", format=".1f"), "attempts_count"],
+        st.altair_chart(accuracy_chart, use_container_width=True)
+        time_chart = (
+            alt.Chart(category_stats)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("category", title="分野"),
+                y=alt.Y("avg_seconds", title="平均解答時間 (秒)", scale=alt.Scale(zero=False)),
+                tooltip=["category", alt.Tooltip("avg_seconds", format=".1f"), "attempts_count"],
+            )
         )
-    )
-    st.altair_chart(time_chart, use_container_width=True)
+        st.altair_chart(time_chart, use_container_width=True)
 
     st.subheader("確信度と正答の相関")
     valid_conf = merged.dropna(subset=["confidence"])
@@ -2325,44 +2451,67 @@ def render_data_io(db: DBManager) -> None:
             if quick_errors:
                 for err in quick_errors:
                     st.error(err)
+                st.info("テンプレートの列構成と突合してください。『テンプレートをダウンロード』から最新のCSVサンプルを取得できます。")
             else:
                 policy = {"explanation": "overwrite", "tags": "merge"}
                 merged_df: Optional[pd.DataFrame] = None
                 rejects_q = pd.DataFrame()
                 rejects_a = pd.DataFrame()
                 conflicts = pd.DataFrame()
+                normalization_failed = False
                 if questions_df is not None:
-                    normalized_q = normalize_questions(questions_df)
+                    try:
+                        normalized_q = normalize_questions(questions_df)
+                    except Exception as exc:
+                        st.error(f"questions.csv の整形に失敗しました: {exc}")
+                        normalization_failed = True
+                        normalized_q = None
                 else:
                     normalized_q = None
                 if answers_df is not None:
-                    normalized_a = normalize_answers(answers_df)
+                    try:
+                        normalized_a = normalize_answers(answers_df)
+                    except Exception as exc:
+                        st.error(f"answers.csv の整形に失敗しました: {exc}")
+                        normalization_failed = True
+                        normalized_a = None
                 else:
                     normalized_a = None
-                if normalized_q is not None and normalized_a is not None:
-                    merged_df, rejects_q, rejects_a, conflicts = merge_questions_answers(
-                        normalized_q, normalized_a, policy=policy
-                    )
-                elif normalized_q is not None:
-                    merged_df = normalized_q
-                elif normalized_a is not None:
-                    existing = load_questions_df()
-                    if existing.empty:
-                        st.error("設問データが存在しません。answers.csv を取り込む前に questions.csv を読み込んでください。")
-                    else:
+                if normalization_failed:
+                    st.warning("列名や値の形式を見直してから再度インポートしてください。")
+                else:
+                    if normalized_q is not None and normalized_a is not None:
                         merged_df, rejects_q, rejects_a, conflicts = merge_questions_answers(
-                            existing, normalized_a, policy=policy
+                            normalized_q, normalized_a, policy=policy
                         )
-                if merged_df is not None:
-                    inserted, updated = db.upsert_questions(merged_df)
-                    rebuild_tfidf_cache()
-                    st.success(f"クイックインポートが完了しました。追加 {inserted} 件 / 更新 {updated} 件")
-                    if not rejects_q.empty or not rejects_a.empty:
-                        st.warning(
-                            f"取り込めなかったレコードがあります。questions: {len(rejects_q)} 件 / answers: {len(rejects_a)} 件"
-                        )
-                    if not conflicts.empty:
-                        st.info(f"正答の衝突が {len(conflicts)} 件あり、上書きしました。")
+                    elif normalized_q is not None:
+                        merged_df = normalized_q
+                    elif normalized_a is not None:
+                        existing = load_questions_df()
+                        if existing.empty:
+                            st.error("設問データが存在しません。answers.csv を取り込む前に questions.csv を読み込んでください。")
+                        else:
+                            merged_df, rejects_q, rejects_a, conflicts = merge_questions_answers(
+                                existing, normalized_a, policy=policy
+                            )
+                    if merged_df is not None:
+                        inserted, updated = db.upsert_questions(merged_df)
+                        rebuild_tfidf_cache()
+                        st.success(f"クイックインポートが完了しました。追加 {inserted} 件 / 更新 {updated} 件")
+                        if not rejects_q.empty or not rejects_a.empty:
+                            st.warning(
+                                f"取り込めなかったレコードがあります。questions: {len(rejects_q)} 件 / answers: {len(rejects_a)} 件"
+                            )
+                            with st.expander("取り込めなかった行の詳細", expanded=False):
+                                if not rejects_q.empty:
+                                    st.markdown("**questions.csv**")
+                                    st.dataframe(rejects_q.head(20))
+                                if not rejects_a.empty:
+                                    st.markdown("**answers.csv**")
+                                    st.dataframe(rejects_a.head(20))
+                                st.caption("理由列を参考にCSVの該当行を修正してください。全件はrejects_*.csvでダウンロードできます。")
+                        if not conflicts.empty:
+                            st.info(f"正答の衝突が {len(conflicts)} 件あり、上書きしました。")
     st.markdown("### クイックエクスポート (questions.csv / answers.csv)")
     existing_questions = load_questions_df()
     if existing_questions.empty:
@@ -2640,27 +2789,50 @@ def render_data_io(db: DBManager) -> None:
 def render_settings() -> None:
     st.title("設定")
     settings = st.session_state["settings"]
-    settings["theme"] = st.selectbox("テーマ", ["ライト", "ダーク"], index=0 if settings.get("theme") == "ライト" else 1)
-    settings["shuffle_choices"] = st.checkbox("選択肢をシャッフル", value=settings.get("shuffle_choices", True))
-    settings["timer"] = st.checkbox("タイマーを表示", value=settings.get("timer", True))
-    settings["sm2_initial_ease"] = st.slider("SM-2初期ease", 1.3, 3.0, settings.get("sm2_initial_ease", 2.5))
+    st.info("学習体験を自分好みにカスタマイズできます。各項目の説明を参考に調整してください。")
+    settings["theme"] = st.selectbox(
+        "テーマ",
+        ["ライト", "ダーク"],
+        index=0 if settings.get("theme") == "ライト" else 1,
+        help="画面の配色を切り替えます。暗い環境ではダークテーマがおすすめです。",
+    )
+    settings["shuffle_choices"] = st.checkbox(
+        "選択肢をシャッフル",
+        value=settings.get("shuffle_choices", True),
+        help="毎回選択肢の順番をランダムに入れ替えて、位置記憶に頼らない訓練を行います。",
+    )
+    settings["timer"] = st.checkbox(
+        "タイマーを表示",
+        value=settings.get("timer", True),
+        help="回答画面に経過時間を表示して本番同様の時間感覚を養います。",
+    )
+    settings["sm2_initial_ease"] = st.slider(
+        "SM-2初期ease",
+        1.3,
+        3.0,
+        settings.get("sm2_initial_ease", 2.5),
+        help="間隔反復アルゴリズムの初期難易度です。既定値2.5で迷ったらそのままにしましょう。",
+    )
     settings["auto_advance"] = st.checkbox(
         "採点後に自動で次問へ進む (0.8秒遅延)",
         value=settings.get("auto_advance", False),
+        help="正誤判定後に待機せず次の問題へ進みたい場合に有効化します。",
     )
     settings["review_low_confidence_threshold"] = st.slider(
         "低確信として扱う確信度 (%)",
         0,
         100,
         int(settings.get("review_low_confidence_threshold", 60)),
+        help="自己評価の確信度がこの値未満なら復習対象に含めます。",
     )
     settings["review_elapsed_days"] = st.slider(
         "復習抽出の経過日数しきい値",
         1,
         30,
         int(settings.get("review_elapsed_days", 7)),
+        help="最終挑戦からこの日数が経過した問題を復習候補に追加します。",
     )
-    if st.button("TF-IDFを再学習"):
+    if st.button("TF-IDFを再学習", help="検索精度が気になるときに再計算します。データ更新後の再実行がおすすめです。"):
         rebuild_tfidf_cache()
         st.success("TF-IDFを再学習しました")
 
