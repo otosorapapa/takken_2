@@ -313,6 +313,10 @@ def clear_global_search() -> None:
     st.session_state["global_search_submitted"] = False
 
 
+def request_clear_global_search() -> None:
+    st.session_state["global_search_should_clear"] = True
+
+
 def set_global_search_query(query: str) -> None:
     st.session_state["global_search_input"] = query
     st.session_state["global_search_query"] = query
@@ -1638,6 +1642,7 @@ def init_session_state() -> None:
         "global_search_input": "",
         "global_search_query": "",
         "global_search_submitted": False,
+        "global_search_should_clear": False,
         "settings": {
             "shuffle_choices": True,
             "theme": "ライト",
@@ -1657,6 +1662,9 @@ def init_session_state() -> None:
 def main() -> None:
     st.set_page_config(page_title="宅建10年ドリル", layout="wide")
     init_session_state()
+    if st.session_state.get("global_search_should_clear"):
+        clear_global_search()
+        st.session_state["global_search_should_clear"] = False
     apply_user_preferences()
     engine = get_engine()
     db = DBManager(engine)
@@ -1689,8 +1697,13 @@ def main() -> None:
     search_action_cols = sidebar.columns(2)
     if search_action_cols[0].button("検索", key="global_search_button"):
         trigger_global_search()
-    if search_action_cols[1].button("条件クリア", key="global_search_clear", type="secondary"):
-        clear_global_search()
+    if search_action_cols[1].button(
+        "条件クリア",
+        key="global_search_clear",
+        type="secondary",
+    ):
+        request_clear_global_search()
+        safe_rerun()
     search_query = st.session_state.get("global_search_query", "")
     with sidebar.expander("キーワードヒント", expanded=False):
         st.caption("よく使う語句をクリックすると検索欄に自動入力されます。")
