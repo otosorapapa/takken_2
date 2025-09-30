@@ -4518,31 +4518,46 @@ def render_settings() -> None:
         value=settings.get("timer", True),
         help="回答画面に経過時間を表示して本番同様の時間感覚を養います。",
     )
+    sm2_key = "settings_sm2_initial_ease"
+    current_sm2 = settings.get("sm2_initial_ease", 2.5)
+    if st.session_state.get(sm2_key) != current_sm2:
+        st.session_state[sm2_key] = current_sm2
     settings["sm2_initial_ease"] = st.slider(
         "SM-2初期ease",
-        1.3,
-        3.0,
-        settings.get("sm2_initial_ease", 2.5),
+        min_value=1.3,
+        max_value=3.0,
+        value=st.session_state[sm2_key],
         help="間隔反復アルゴリズムの初期難易度です。既定値2.5で迷ったらそのままにしましょう。",
+        key=sm2_key,
     )
     settings["auto_advance"] = st.checkbox(
         "採点後に自動で次問へ進む (0.8秒遅延)",
         value=settings.get("auto_advance", False),
         help="正誤判定後に待機せず次の問題へ進みたい場合に有効化します。",
     )
+    low_conf_key = "settings_review_low_confidence_threshold"
+    current_low_conf = int(settings.get("review_low_confidence_threshold", 60))
+    if st.session_state.get(low_conf_key) != current_low_conf:
+        st.session_state[low_conf_key] = current_low_conf
     settings["review_low_confidence_threshold"] = st.slider(
         "低確信として扱う確信度 (%)",
-        0,
-        100,
-        int(settings.get("review_low_confidence_threshold", 60)),
+        min_value=0,
+        max_value=100,
+        value=st.session_state[low_conf_key],
         help="自己評価の確信度がこの値未満なら復習対象に含めます。",
+        key=low_conf_key,
     )
+    elapsed_key = "settings_review_elapsed_days"
+    current_elapsed = int(settings.get("review_elapsed_days", 7))
+    if st.session_state.get(elapsed_key) != current_elapsed:
+        st.session_state[elapsed_key] = current_elapsed
     settings["review_elapsed_days"] = st.slider(
         "復習抽出の経過日数しきい値",
-        1,
-        30,
-        int(settings.get("review_elapsed_days", 7)),
+        min_value=1,
+        max_value=30,
+        value=st.session_state[elapsed_key],
         help="最終挑戦からこの日数が経過した問題を復習候補に追加します。",
+        key=elapsed_key,
     )
     if st.button("TF-IDFを再学習", help="検索精度が気になるときに再計算します。データ更新後の再実行がおすすめです。"):
         rebuild_tfidf_cache()
