@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+sqlalchemy
+altair
+scikit-learn
+openpyxl
+rapidfuzz
