@@ -280,7 +280,7 @@ def ensure_schema_migrations(engine: Engine) -> None:
 
 def apply_user_preferences() -> None:
     settings = st.session_state.get("settings", {})
-    theme = settings.get("theme", "ライト")
+    theme = settings.get("theme", "セピア")
     font_label = settings.get("font_size", "標準")
     scale = FONT_SIZE_SCALE.get(font_label, 1.0)
     base_css = f"""
@@ -2222,7 +2222,7 @@ def init_session_state() -> None:
         "_global_search_input_widget": "",
         "settings": {
             "shuffle_choices": True,
-            "theme": "ライト",
+            "theme": "セピア",
             "font_size": "標準",
             "timer": True,
             "sm2_initial_ease": 2.5,
@@ -4474,7 +4474,7 @@ def render_settings() -> None:
     settings = st.session_state["settings"]
     st.info("学習体験を自分好みにカスタマイズできます。各項目の説明を参考に調整してください。")
     theme_options = ["ライト", "ダーク", "セピア"]
-    current_theme = settings.get("theme", "ライト")
+    current_theme = settings.get("theme", "セピア")
     theme_index = theme_options.index(current_theme) if current_theme in theme_options else 0
     settings["theme"] = st.selectbox(
         "テーマ",
