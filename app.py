@@ -3158,11 +3158,53 @@ def format_question_label(df: pd.DataFrame, question_id: str) -> str:
     return f"{year_display}年 問{q_no_display} ({category_display})"
 
 
+def build_law_reference_query(row: pd.Series) -> Optional[str]:
+    candidates: List[str] = []
+
+    def append_parts(value: Optional[str]) -> None:
+        if not isinstance(value, str):
+            return
+        parts = re.split(r"[;／/]+", value)
+        for part in parts:
+            part = part.strip()
+            if part:
+                candidates.append(part)
+
+    tags_value = row.get("tags")
+    if isinstance(tags_value, str):
+        tag_parts = [part.strip() for part in tags_value.split(";") if part.strip()]
+        # 検索に不要な年度タグなどを除外する。
+        tag_parts = [part for part in tag_parts if not re.fullmatch(r"R\d+", part, re.IGNORECASE)]
+        for part in tag_parts:
+            append_parts(part)
+    else:
+        append_parts(tags_value)
+
+    append_parts(row.get("topic"))
+    append_parts(row.get("category"))
+
+    seen: Set[str] = set()
+    filtered: List[str] = []
+    for text in candidates:
+        if re.fullmatch(r"R\d+", text, re.IGNORECASE):
+            continue
+        if re.fullmatch(r"\d+", text):
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        filtered.append(text)
+
+    if not filtered:
+        return None
+
+    return " ".join(filtered)
+
+
 def render_law_reference(row: pd.Series) -> None:
-    query_source = row.get("tags") or row.get("topic") or row.get("category")
-    if query_source:
-        query = quote_plus(str(query_source).split(";")[0])
-        url = LAW_REFERENCE_BASE_URL.format(query=query)
+    query = build_law_reference_query(row)
+    if query:
+        url = LAW_REFERENCE_BASE_URL.format(query=quote_plus(query))
         st.caption(f"{LAW_BASELINE_LABEL} ｜ [条文検索]({url})")
     else:
         st.caption(LAW_BASELINE_LABEL)
