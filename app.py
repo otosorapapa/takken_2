@@ -405,10 +405,13 @@ def set_global_search_query(query: str) -> None:
 
 
 def safe_rerun() -> None:
-    try:
-        st.rerun()
-    except AttributeError:
-        st.experimental_rerun()
+    rerun = getattr(st, "rerun", None)
+    experimental_rerun = getattr(st, "experimental_rerun", None)
+    if callable(rerun):
+        rerun()
+    elif callable(experimental_rerun):
+        experimental_rerun()
+
 
 
 def with_rerun(callback: Callable[..., None], *args, **kwargs) -> Callable[[], None]:
@@ -3384,7 +3387,7 @@ def render_question_interaction(
                 ):
                     st.session_state[selected_key] = actual_idx
                     selected_choice = actual_idx
-                    st.experimental_rerun()
+                    safe_rerun()
                 st.markdown("</div>", unsafe_allow_html=True)
     st.caption("1〜4キーで選択肢を即答できます。E:解説 F:フラグ N/P:移動 H:ヘルプ R:SRSリセット")
     confidence_value = st.session_state.get(confidence_key)
@@ -3545,7 +3548,7 @@ def render_question_interaction(
                 ):
                     time.sleep(0.8)
                     navigation.on_next()
-                    st.experimental_rerun()
+                    safe_rerun()
     if feedback and feedback.get("question_id") == row["id"]:
         correct_msg = choice_labels[feedback["correct_choice"] - 1]
         message = "正解です！" if feedback["is_correct"] else f"不正解。正答は {correct_msg}"
