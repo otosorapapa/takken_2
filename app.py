@@ -1109,6 +1109,14 @@ def inject_ui_styles() -> None:
     min-height: 56px;
     font-size: 1.05rem;
     border-radius: 0.8rem;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+    text-align: left;
+    line-height: 1.5;
+    white-space: normal;
+    padding: 0.75rem 1rem;
+    gap: 0.75rem;
 }
 .takken-choice-grid {
     display: grid;
