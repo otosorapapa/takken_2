@@ -24,7 +24,7 @@ from sqlalchemy import (JSON, Column, Date, DateTime, Float, Integer, MetaData,
                         select, tuple_)
 from sqlalchemy import inspect
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.sql import insert as sa_insert, text, update
 
@@ -545,8 +545,12 @@ class DBManager:
         self.engine = engine
 
     def load_dataframe(self, table: Table) -> pd.DataFrame:
-        with self.engine.connect() as conn:
-            df = pd.read_sql(select(table), conn)
+        try:
+            with self.engine.connect() as conn:
+                df = pd.read_sql(select(table), conn)
+        except OperationalError:
+            column_names = [column.name for column in table.columns]
+            return pd.DataFrame(columns=column_names)
         return df
 
     def load_predicted_questions(self) -> pd.DataFrame:
