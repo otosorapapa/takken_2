@@ -311,6 +311,7 @@ def clear_global_search() -> None:
     st.session_state["global_search_input"] = ""
     st.session_state["global_search_query"] = ""
     st.session_state["global_search_submitted"] = False
+    st.session_state.pop("global_search_pending", None)
 
 
 def request_clear_global_search() -> None:
@@ -318,9 +319,13 @@ def request_clear_global_search() -> None:
 
 
 def set_global_search_query(query: str) -> None:
-    st.session_state["global_search_input"] = query
-    st.session_state["global_search_query"] = query
-    st.session_state["global_search_submitted"] = bool(query)
+    normalized = str(query or "").strip()
+    st.session_state["global_search_pending"] = {
+        "query": normalized,
+        "submitted": bool(normalized),
+    }
+    st.session_state["global_search_query"] = normalized
+    st.session_state["global_search_submitted"] = bool(normalized)
 
 
 def safe_rerun() -> None:
@@ -1643,6 +1648,7 @@ def init_session_state() -> None:
         "global_search_query": "",
         "global_search_submitted": False,
         "global_search_should_clear": False,
+        "global_search_pending": None,
         "settings": {
             "shuffle_choices": True,
             "theme": "ライト",
@@ -1665,6 +1671,13 @@ def main() -> None:
     if st.session_state.get("global_search_should_clear"):
         clear_global_search()
         st.session_state["global_search_should_clear"] = False
+    pending_search = st.session_state.pop("global_search_pending", None)
+    if pending_search:
+        query = str(pending_search.get("query", "") or "").strip()
+        submitted = bool(pending_search.get("submitted"))
+        st.session_state["global_search_input"] = query
+        st.session_state["global_search_query"] = query
+        st.session_state["global_search_submitted"] = submitted
     apply_user_preferences()
     engine = get_engine()
     db = DBManager(engine)
@@ -1692,7 +1705,6 @@ def main() -> None:
                 col = suggestion_cols[idx % 2]
                 if col.button(keyword, key=f"global_suggest_{idx}", type="secondary"):
                     set_global_search_query(keyword)
-                    trigger_global_search()
                     safe_rerun()
     search_action_cols = sidebar.columns(2)
     if search_action_cols[0].button("検索", key="global_search_button"):
@@ -1712,6 +1724,7 @@ def main() -> None:
             if hint_cols[idx % 2].button(keyword, key=f"global_search_hint_{idx}"):
                 set_global_search_query(keyword)
                 search_query = keyword
+                safe_rerun()
     sidebar.divider()
     nav = sidebar.radio(
         "メニュー",
