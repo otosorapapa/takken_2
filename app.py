@@ -132,6 +132,29 @@ predicted_questions_table = Table(
     Column("created_at", DateTime, server_default=func.now()),
 )
 
+law_revision_questions_table = Table(
+    "law_revision_questions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("label", String),
+    Column("law_name", String),
+    Column("revision_year", Integer),
+    Column("effective_date", String),
+    Column("category", String),
+    Column("topic", String),
+    Column("source", String),
+    Column("question", String, nullable=False),
+    Column("choice1", String, nullable=False),
+    Column("choice2", String, nullable=False),
+    Column("choice3", String, nullable=False),
+    Column("choice4", String, nullable=False),
+    Column("correct", Integer),
+    Column("explanation", String),
+    Column("difficulty", Integer, default=DIFFICULTY_DEFAULT),
+    Column("tags", String),
+    Column("created_at", DateTime, server_default=func.now()),
+)
+
 attempts_table = Table(
     "attempts",
     metadata,
@@ -446,6 +469,25 @@ PREDICTED_TEMPLATE_COLUMNS = [
     "tags",
 ]
 
+LAW_REVISION_TEMPLATE_COLUMNS = [
+    "label",
+    "law_name",
+    "revision_year",
+    "effective_date",
+    "category",
+    "topic",
+    "source",
+    "question",
+    "choice1",
+    "choice2",
+    "choice3",
+    "choice4",
+    "correct",
+    "explanation",
+    "difficulty",
+    "tags",
+]
+
 
 @st.cache_data(show_spinner=False)
 def get_template_archive() -> bytes:
@@ -505,11 +547,35 @@ def get_template_archive() -> bytes:
         ],
         columns=PREDICTED_TEMPLATE_COLUMNS,
     )
+    law_revision_template = pd.DataFrame(
+        [
+            {
+                "label": "2024年改正ポイント01",
+                "law_name": "宅建業法",
+                "revision_year": dt.datetime.now().year,
+                "effective_date": f"{dt.datetime.now().year}-04-01",
+                "category": CATEGORY_CHOICES[0],
+                "topic": "重要事項説明",
+                "source": "国交省告示",
+                "question": "最近の法改正内容に関する確認問題を入力してください。",
+                "choice1": "改正により重要事項説明書への記載が義務化された。",
+                "choice2": "改正前後で手続は変わらない。",
+                "choice3": "改正で免除規定が新設された。",
+                "choice4": "法改正とは無関係の記載である。",
+                "correct": 1,
+                "explanation": "改正ポイントの概要や根拠条文を記載します。",
+                "difficulty": DIFFICULTY_DEFAULT,
+                "tags": "法改正;直前対策",
+            }
+        ],
+        columns=LAW_REVISION_TEMPLATE_COLUMNS,
+    )
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("questions_template.csv", question_template.to_csv(index=False))
         zf.writestr("answers_template.csv", answer_template.to_csv(index=False))
         zf.writestr("predicted_template.csv", predicted_template.to_csv(index=False))
+        zf.writestr("law_revision_template.csv", law_revision_template.to_csv(index=False))
         q_excel = io.BytesIO()
         with pd.ExcelWriter(q_excel, engine="openpyxl") as writer:
             question_template.to_excel(writer, index=False, sheet_name="questions")
@@ -522,8 +588,13 @@ def get_template_archive() -> bytes:
         with pd.ExcelWriter(p_excel, engine="openpyxl") as writer:
             predicted_template.to_excel(writer, index=False, sheet_name="predicted")
         zf.writestr("predicted_template.xlsx", p_excel.getvalue())
+        lr_excel = io.BytesIO()
+        with pd.ExcelWriter(lr_excel, engine="openpyxl") as writer:
+            law_revision_template.to_excel(writer, index=False, sheet_name="law_revision")
+        zf.writestr("law_revision_template.xlsx", lr_excel.getvalue())
         description = (
-            "questions_template は設問データ、answers_template は正答データ、predicted_template は予想問題データのサンプルです。\n"
+            "questions_template は設問データ、answers_template は正答データ、predicted_template は予想問題データ、"
+            "law_revision_template は法改正予想問題データのサンプルです。\n"
             "不要な行は削除し、ご自身のデータを入力してからアップロードしてください。"
         )
         zf.writestr("README.txt", description)
@@ -555,6 +626,9 @@ class DBManager:
 
     def load_predicted_questions(self) -> pd.DataFrame:
         return self.load_dataframe(predicted_questions_table)
+
+    def load_law_revision_questions(self) -> pd.DataFrame:
+        return self.load_dataframe(law_revision_questions_table)
 
     def upsert_questions(self, df: pd.DataFrame) -> Tuple[int, int]:
         records = df.to_dict(orient="records")
@@ -647,6 +721,38 @@ class DBManager:
                     updated += 1
                 else:
                     conn.execute(sa_insert(predicted_questions_table).values(**rec))
+                    inserted += 1
+                    if rec_id:
+                        existing_ids.add(rec_id)
+        return inserted, updated
+
+    def upsert_law_revision_questions(self, df: pd.DataFrame) -> Tuple[int, int]:
+        records = df.to_dict(orient="records")
+        ids = [rec["id"] for rec in records if "id" in rec]
+        inserted = 0
+        updated = 0
+        with self.engine.begin() as conn:
+            existing_ids: Set[str] = set()
+            if ids:
+                existing_ids = set(
+                    conn.execute(
+                        select(law_revision_questions_table.c.id).where(
+                            law_revision_questions_table.c.id.in_(ids)
+                        )
+                    ).scalars()
+                )
+            for rec in records:
+                rec_id = rec.get("id")
+                payload = {k: v for k, v in rec.items() if k != "id"}
+                if rec_id in existing_ids:
+                    conn.execute(
+                        update(law_revision_questions_table)
+                        .where(law_revision_questions_table.c.id == rec_id)
+                        .values(**payload)
+                    )
+                    updated += 1
+                else:
+                    conn.execute(sa_insert(law_revision_questions_table).values(**rec))
                     inserted += 1
                     if rec_id:
                         existing_ids.add(rec_id)
@@ -908,6 +1014,14 @@ def generate_predicted_question_id(row: pd.Series) -> str:
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
 
 
+def generate_law_revision_question_id(row: pd.Series) -> str:
+    base = (
+        f"lawrev|{row.get('law_name', '')}|{row.get('revision_year', '')}|"
+        f"{str(row.get('question', ''))[:80]}"
+    )
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+
+
 def normalize_predicted_questions(
     df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None
 ) -> pd.DataFrame:
@@ -964,6 +1078,53 @@ def normalize_predicted_questions(
         "difficulty",
         "tags",
     ]
+    df = df[columns]
+    return df
+
+
+def normalize_law_revision_questions(
+    df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None
+) -> pd.DataFrame:
+    df = df.copy()
+    if mapping:
+        df = df.rename(columns=mapping)
+    required_cols = ["law_name", "question", "choice1", "choice2", "choice3", "choice4"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"必要な列が不足しています: {col}")
+    for col in ["question", "choice1", "choice2", "choice3", "choice4"]:
+        df[col] = df[col].fillna("").astype(str)
+    df["law_name"] = df.get("law_name", "").fillna("").astype(str)
+    optional_str_cols = ["label", "category", "topic", "source", "effective_date", "explanation", "tags"]
+    for col in optional_str_cols:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+    df["revision_year"] = (
+        pd.to_numeric(df.get("revision_year"), errors="coerce")
+        .astype("Int64")
+    )
+    if "difficulty" not in df.columns:
+        df["difficulty"] = DIFFICULTY_DEFAULT
+    df["difficulty"] = (
+        df.get("difficulty")
+        .fillna(DIFFICULTY_DEFAULT)
+        .replace("", DIFFICULTY_DEFAULT)
+        .astype(int)
+    )
+    if "correct" in df.columns:
+        df["correct"] = (
+            pd.to_numeric(df["correct"], errors="coerce")
+            .where(lambda x: x.isin([1, 2, 3, 4]))
+            .astype("Int64")
+        )
+    else:
+        df["correct"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+    if "id" not in df.columns or df["id"].isna().any() or (df["id"].astype(str).str.strip() == "").any():
+        df["id"] = df.apply(generate_law_revision_question_id, axis=1)
+    df["id"] = df["id"].astype(str)
+    df = df.drop_duplicates(subset=["id"])
+    columns = LAW_REVISION_TEMPLATE_COLUMNS.copy()
     df = df[columns]
     return df
 
@@ -1063,6 +1224,50 @@ def validate_predicted_records(df: pd.DataFrame) -> List[str]:
         non_empty = [c for c in choices if c]
         if len(set(non_empty)) < len(non_empty):
             errors.append(f"{label}: 選択肢が重複しています。")
+    if "id" in working.columns:
+        dup_ids = working[working["id"].notna() & working["id"].astype(str).str.strip().duplicated()]["id"].unique()
+        if dup_ids.size > 0:
+            errors.append(f"重複したIDが存在します: {', '.join(map(str, dup_ids[:5]))}")
+    return errors
+
+
+def validate_law_revision_records(df: pd.DataFrame) -> List[str]:
+    errors: List[str] = []
+    required_cols = ["law_name", "question", "choice1", "choice2", "choice3", "choice4"]
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        errors.append(f"必須列が不足しています: {', '.join(missing)}")
+        return errors
+    working = df.reset_index(drop=True)
+    for row_number, row in enumerate(working.itertuples(index=False), start=2):
+        label = getattr(row, "label", "") or f"行{row_number}"
+        law_name = str(getattr(row, "law_name", "")).strip()
+        if not law_name:
+            errors.append(f"{label}: 法令名 (law_name) を入力してください。")
+        question_text = str(getattr(row, "question", "")).strip()
+        if not question_text:
+            errors.append(f"{label}: 問題文が空欄です。")
+        choices = [str(getattr(row, f"choice{i}", "")).strip() for i in range(1, 5)]
+        if any(choice == "" for choice in choices):
+            errors.append(f"{label}: 空欄の選択肢があります。")
+        non_empty = [c for c in choices if c]
+        if len(set(non_empty)) < len(non_empty):
+            errors.append(f"{label}: 選択肢が重複しています。")
+        revision_year_value = getattr(row, "revision_year", None)
+        if revision_year_value not in (None, "", pd.NA):
+            try:
+                int(str(revision_year_value).strip())
+            except Exception:
+                errors.append(f"{label}: revision_year は西暦の数値で入力してください。")
+        correct_value = getattr(row, "correct", None)
+        if correct_value not in (None, "", pd.NA):
+            try:
+                numeric_correct = int(correct_value)
+            except Exception:
+                errors.append(f"{label}: correct は1〜4の数値で入力してください。")
+            else:
+                if numeric_correct not in {1, 2, 3, 4}:
+                    errors.append(f"{label}: correct は1〜4の範囲で指定してください。")
     if "id" in working.columns:
         dup_ids = working[working["id"].notna() & working["id"].astype(str).str.strip().duplicated()]["id"].unique()
         if dup_ids.size > 0:
@@ -1200,6 +1405,32 @@ def build_sample_predicted_csv() -> str:
     ]
     buffer = io.StringIO()
     pd.DataFrame(sample_rows, columns=PREDICTED_TEMPLATE_COLUMNS).to_csv(buffer, index=False)
+    return buffer.getvalue()
+
+
+def build_sample_law_revision_csv() -> str:
+    sample_rows = [
+        {
+            "label": "法改正対策001",
+            "law_name": "宅建業法",
+            "revision_year": dt.datetime.now().year,
+            "effective_date": f"{dt.datetime.now().year}-04-01",
+            "category": "宅建業法",
+            "topic": "改正ポイント",
+            "source": "官報",
+            "question": "最新の宅建業法改正で追加された説明義務について正しいものはどれか。",
+            "choice1": "重要事項説明書に改正内容を追記する必要がある。",
+            "choice2": "買主が希望すれば省略できる。",
+            "choice3": "宅建士証の提示義務が免除された。",
+            "choice4": "宅地建物以外の取引に限り適用される。",
+            "correct": 1,
+            "explanation": "改正条文のポイントを記載します。",
+            "difficulty": DIFFICULTY_DEFAULT,
+            "tags": "法改正;直前対策",
+        }
+    ]
+    buffer = io.StringIO()
+    pd.DataFrame(sample_rows, columns=LAW_REVISION_TEMPLATE_COLUMNS).to_csv(buffer, index=False)
     return buffer.getvalue()
 
 
@@ -2138,7 +2369,17 @@ def render_learning(db: DBManager, df: pd.DataFrame) -> None:
     if df.empty:
         st.warning("設問データがありません。『データ入出力』からアップロードしてください。")
         return
-    tabs = st.tabs(["本試験モード", "適応学習", "分野別ドリル", "年度別演習", "弱点克服モード", "予想問題演習"])
+    tabs = st.tabs(
+        [
+            "本試験モード",
+            "適応学習",
+            "分野別ドリル",
+            "年度別演習",
+            "弱点克服モード",
+            "法改正対策",
+            "予想問題演習",
+        ]
+    )
     with tabs[0]:
         render_full_exam_lane(db, df)
     with tabs[1]:
@@ -2150,6 +2391,8 @@ def render_learning(db: DBManager, df: pd.DataFrame) -> None:
     with tabs[4]:
         render_weakness_lane(db, df)
     with tabs[5]:
+        render_law_revision_lane(db)
+    with tabs[6]:
         render_predicted_lane(db)
 
 
@@ -2497,6 +2740,233 @@ def render_weakness_lane(db: DBManager, df: pd.DataFrame) -> None:
     )
     row = df[df["id"] == selected_qid].iloc[0]
     render_question_interaction(db, row, attempt_mode="weakness", key_prefix="weakness")
+
+
+def render_law_revision_lane(db: DBManager) -> None:
+    st.subheader("法改正対策")
+    law_df = db.load_law_revision_questions()
+    if law_df.empty:
+        st.info(
+            "法改正予想問題データが登録されていません。『データ入出力』タブから law_revision.csv を取り込みましょう。"
+        )
+        return
+    st.caption(
+        "最新の法改正ポイントを重点的に演習できます。正答が未設定の場合は自己採点してください。"
+    )
+    total_questions = len(law_df)
+    summary_cols = st.columns(3)
+    with summary_cols[0]:
+        st.metric("登録数", total_questions)
+    with summary_cols[1]:
+        unique_laws = law_df["law_name"].replace("", pd.NA).dropna().nunique()
+        st.metric("対象法令", int(unique_laws) if not pd.isna(unique_laws) else 0)
+    with summary_cols[2]:
+        recent_years = law_df["revision_year"].dropna()
+        if recent_years.empty:
+            st.metric("最新改正年度", "未設定")
+        else:
+            st.metric("最新改正年度", f"{int(recent_years.max())}年")
+    with st.expander("出題条件", expanded=True):
+        law_names = sorted(
+            {
+                str(name).strip()
+                for name in law_df.get("law_name", pd.Series(dtype="object")).dropna()
+                if str(name).strip()
+            }
+        )
+        if law_names:
+            selected_laws = st.multiselect(
+                "対象法令",
+                law_names,
+                default=law_names,
+                key="law_revision_laws",
+            )
+        else:
+            selected_laws = []
+        category_candidates = sorted(
+            {
+                str(cat).strip()
+                for cat in law_df.get("category", pd.Series(dtype="object")).dropna()
+                if str(cat).strip()
+            }
+        )
+        if category_candidates:
+            selected_categories = st.multiselect(
+                "分野タグ",
+                category_candidates,
+                default=category_candidates,
+                key="law_revision_categories",
+            )
+        else:
+            selected_categories = []
+        year_series = law_df.get("revision_year")
+        include_unknown_year = st.checkbox(
+            "改正年未設定の問題も含める",
+            value=True,
+            key="law_revision_include_unknown",
+        )
+        year_range = None
+        if year_series is not None and year_series.dropna().size > 0:
+            min_year = int(year_series.dropna().min())
+            max_year = int(year_series.dropna().max())
+            if min_year == max_year:
+                default_range = (min_year, max_year)
+            else:
+                default_range = (max(min_year, max_year - 4), max_year)
+            year_range = st.slider(
+                "改正年度",
+                min_year,
+                max_year,
+                default_range,
+                key="law_revision_year_range",
+            )
+        keyword = st.text_input(
+            "キーワードフィルタ",
+            value="",
+            key="law_revision_keyword",
+            help="問題文・タグ・法令名を部分一致で絞り込みます。",
+        )
+    filtered = law_df.copy()
+    if selected_laws:
+        filtered = filtered[filtered["law_name"].isin(selected_laws)]
+    if selected_categories:
+        filtered = filtered[filtered["category"].isin(selected_categories)]
+    if year_range:
+        start_year, end_year = year_range
+        mask = filtered["revision_year"].between(start_year, end_year)
+        if include_unknown_year:
+            mask = mask | filtered["revision_year"].isna()
+        filtered = filtered[mask]
+    elif not include_unknown_year:
+        filtered = filtered[filtered["revision_year"].notna()]
+    if keyword:
+        keyword = keyword.strip()
+        if keyword:
+            contains_mask = (
+                filtered.get("question", pd.Series(dtype="object")).fillna("").str.contains(keyword, case=False)
+                | filtered.get("tags", pd.Series(dtype="object")).fillna("").str.contains(keyword, case=False)
+                | filtered.get("law_name", pd.Series(dtype="object")).fillna("").str.contains(keyword, case=False)
+                | filtered.get("topic", pd.Series(dtype="object")).fillna("").str.contains(keyword, case=False)
+            )
+            filtered = filtered[contains_mask]
+    if filtered.empty:
+        st.warning("条件に一致する法改正問題がありません。フィルタを緩和してください。")
+        return
+    with st.expander("法改正問題一覧", expanded=False):
+        preview_cols = [
+            "law_name",
+            "revision_year",
+            "effective_date",
+            "label",
+            "category",
+            "question",
+        ]
+        available_cols = [col for col in preview_cols if col in filtered.columns]
+        st.dataframe(filtered[available_cols].head(20))
+        st.caption("20件まで表示しています。CSVで詳細を確認できます。")
+    max_questions = max(1, len(filtered))
+    default_count = min(10, max_questions)
+    col1, col2 = st.columns(2)
+    with col1:
+        question_count = st.slider(
+            "出題数",
+            1,
+            max_questions,
+            default_count,
+            key="law_revision_question_count",
+        )
+    with col2:
+        order_option = st.radio(
+            "出題順",
+            ["ランダム", "改正年が新しい順", "登録順"],
+            key="law_revision_order",
+            horizontal=True,
+        )
+
+    def start_law_revision_session() -> None:
+        selection = filtered
+        if order_option == "ランダム":
+            selection = selection.sample(question_count)
+        elif order_option == "改正年が新しい順":
+            selection = selection.sort_values(
+                ["revision_year", "created_at"], ascending=[False, False]
+            ).head(question_count)
+        else:
+            selection = selection.head(question_count)
+        selection = selection.reset_index(drop=True)
+        st.session_state["law_revision_session"] = {
+            "questions": selection.to_dict(orient="records"),
+            "index": 0,
+            "started_at": dt.datetime.now().isoformat(),
+            "run_id": hashlib.sha256(f"lawrev|{time.time()}".encode("utf-8")).hexdigest()[:8],
+        }
+
+    st.button(
+        "法改正問題を開始",
+        key="law_revision_start",
+        type="primary",
+        on_click=with_rerun(start_law_revision_session),
+    )
+
+    session = st.session_state.get("law_revision_session")
+    if not session:
+        return
+    questions = session.get("questions", [])
+    if not questions:
+        st.warning("セッションに問題がありません。再度開始してください。")
+        return
+    index = session.get("index", 0)
+    total = len(questions)
+    index = max(0, min(index, total - 1))
+    st.progress((index + 1) / total)
+
+    def set_index(new_index: int) -> None:
+        current = st.session_state.get("law_revision_session", {})
+        current["index"] = new_index
+        st.session_state["law_revision_session"] = current
+
+    row_series = pd.Series(questions[index])
+    navigation = QuestionNavigation(
+        has_prev=index > 0,
+        has_next=index < total - 1,
+        on_prev=with_rerun(set_index, max(0, index - 1)),
+        on_next=with_rerun(set_index, min(total - 1, index + 1)),
+        label=f"{index + 1}/{total} 問を学習中",
+    )
+    render_law_revision_metadata(row_series)
+    render_question_interaction(
+        db,
+        row_series,
+        attempt_mode="law_revision",
+        key_prefix=f"law_revision_{session.get('run_id', 'session')}",
+        navigation=navigation,
+        enable_srs=False,
+        log_attempts=False,
+    )
+    action_cols = st.columns([1, 1, 2])
+    with action_cols[0]:
+        st.button(
+            "前の問題",
+            use_container_width=True,
+            disabled=index <= 0,
+            on_click=with_rerun(set_index, max(0, index - 1)),
+            key="law_revision_prev_button",
+        )
+    with action_cols[1]:
+        st.button(
+            "次の問題",
+            use_container_width=True,
+            disabled=index >= total - 1,
+            on_click=with_rerun(set_index, min(total - 1, index + 1)),
+            key="law_revision_next_button",
+        )
+    with action_cols[2]:
+        st.caption(f"演習中 {index + 1}/{total} 問")
+    st.button(
+        "セッションを終了",
+        key="law_revision_end_session",
+        on_click=with_rerun(lambda: st.session_state.pop("law_revision_session", None)),
+    )
 
 
 def render_predicted_lane(db: DBManager) -> None:
@@ -3168,6 +3638,30 @@ def render_law_reference(row: pd.Series) -> None:
         st.caption(LAW_BASELINE_LABEL)
 
 
+def render_law_revision_metadata(row: pd.Series) -> None:
+    details: List[str] = []
+    law_name = row.get("law_name")
+    if pd.notna(law_name) and str(law_name).strip():
+        details.append(f"**法令**: {str(law_name).strip()}")
+    revision_year = row.get("revision_year")
+    if pd.notna(revision_year) and str(revision_year).strip():
+        try:
+            details.append(f"**改正年度**: {int(revision_year)}年")
+        except Exception:
+            details.append(f"**改正年度**: {revision_year}")
+    effective_date = row.get("effective_date")
+    if pd.notna(effective_date) and str(effective_date).strip():
+        details.append(f"**施行日**: {str(effective_date).strip()}")
+    source = row.get("source")
+    if pd.notna(source) and str(source).strip():
+        details.append(f"**出典**: {str(source).strip()}")
+    tags = row.get("tags")
+    if pd.notna(tags) and str(tags).strip():
+        details.append(f"**タグ**: {str(tags).strip()}")
+    if details:
+        st.caption(" ｜ ".join(details))
+
+
 def render_question_preview(row: pd.Series) -> None:
     render_law_reference(row)
     question_text = row.get("question", "")
@@ -3421,7 +3915,7 @@ def render_data_io(db: DBManager) -> None:
         mime="application/zip",
     )
     st.caption("設問・正答データのCSV/XLSXテンプレートが含まれます。必要に応じて編集してご利用ください。")
-    sample_cols = st.columns(3)
+    sample_cols = st.columns(4)
     with sample_cols[0]:
         st.download_button(
             "サンプル questions.csv",
@@ -3445,6 +3939,14 @@ def render_data_io(db: DBManager) -> None:
             file_name="sample_predicted.csv",
             mime="text/csv",
             help="予想問題の入力例です。ラベルや出典を記入して活用ください。",
+        )
+    with sample_cols[3]:
+        st.download_button(
+            "サンプル law_revision.csv",
+            data=build_sample_law_revision_csv(),
+            file_name="sample_law_revision.csv",
+            mime="text/csv",
+            help="最新の法改正論点を整理した問題サンプルです。改正年度や施行日を追記してご利用ください。",
         )
     st.caption("サンプルCSVはExcelに貼り付けて使えるよう列幅を調整済みです。コピー&ペーストで手早く登録できます。")
     st.markdown("### クイックインポート (questions.csv / answers.csv)")
@@ -3592,6 +4094,52 @@ def render_data_io(db: DBManager) -> None:
                             use_container_width=True,
                         )
                         st.caption("取り込んだ予想問題の先頭10件を表示しています。")
+    st.markdown("### 法改正予想問題インポート (law_revision.csv)")
+    law_revision_file = st.file_uploader(
+        "law_revision.csv をアップロード",
+        type=["csv"],
+        key="law_revision_file_uploader",
+        help="ここ数年の法改正に関する予想問題データをCSVで読み込みます。改正年度や施行日も登録できます。",
+    )
+    if st.button("法改正予想問題インポート実行", key="law_revision_import_button"):
+        if law_revision_file is None:
+            st.warning("law_revision.csv を選択してください。")
+        else:
+            data = law_revision_file.getvalue()
+            try:
+                law_revision_df = pd.read_csv(io.BytesIO(data))
+            except UnicodeDecodeError:
+                law_revision_df = pd.read_csv(io.BytesIO(data), encoding="cp932")
+            errors = validate_law_revision_records(law_revision_df)
+            if errors:
+                for err in errors:
+                    st.error(err)
+                st.info("テンプレートの列構成に合わせて再度アップロードしてください。")
+            else:
+                try:
+                    normalized_law_revision = normalize_law_revision_questions(law_revision_df)
+                except Exception as exc:
+                    st.error(f"law_revision.csv の整形に失敗しました: {exc}")
+                else:
+                    inserted, updated = db.upsert_law_revision_questions(normalized_law_revision)
+                    st.success(
+                        f"法改正予想問題データを取り込みました。追加 {inserted} 件 / 更新 {updated} 件"
+                    )
+                    st.session_state.pop("law_revision_session", None)
+                    if not normalized_law_revision.empty:
+                        preview_cols = [
+                            "label",
+                            "law_name",
+                            "revision_year",
+                            "effective_date",
+                            "question",
+                            "correct",
+                        ]
+                        st.dataframe(
+                            normalized_law_revision.head(10)[preview_cols],
+                            use_container_width=True,
+                        )
+                        st.caption("取り込んだ法改正予想問題の先頭10件を表示しています。")
     st.markdown("### クイックエクスポート (questions.csv / answers.csv)")
     existing_questions = load_questions_df()
     if existing_questions.empty:
