@@ -7,6 +7,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
@@ -40,6 +41,8 @@ DEFAULT_CATEGORY_MAP = {
 }
 CATEGORY_CHOICES = ["宅建業法", "権利関係", "法令上の制限", "税・その他"]
 DIFFICULTY_DEFAULT = 3
+LAW_BASELINE_LABEL = "適用法令基準日（R6/4/1）"
+LAW_REFERENCE_BASE_URL = "https://elaws.e-gov.go.jp/search?q={query}"
 
 metadata = MetaData()
 
@@ -295,6 +298,14 @@ class DBManager:
                 )
             )
 
+    def log_exam_result(self, payload: Dict[str, object]) -> Optional[int]:
+        with self.engine.begin() as conn:
+            result = conn.execute(sa_insert(exams_table).values(**payload))
+            inserted = result.inserted_primary_key
+        if inserted:
+            return inserted[0]
+        return None
+
     def update_question_fields(
         self,
         question_id: str,
@@ -312,7 +323,15 @@ class DBManager:
             df = pd.read_sql(
                 text(
                     """
-                    SELECT q.category, q.year, a.is_correct, a.created_at, a.seconds
+                    SELECT
+                        a.question_id,
+                        q.category,
+                        q.year,
+                        a.is_correct,
+                        a.created_at,
+                        a.seconds,
+                        a.selected,
+                        a.mode
                     FROM attempts a
                     JOIN questions q ON q.id = a.question_id
                     """
@@ -598,6 +617,7 @@ class ExamSession:
     questions: List[str]
     started_at: dt.datetime
     year_mode: str
+    mode: str
 
 
 def select_random_questions(df: pd.DataFrame, count: int) -> List[str]:
@@ -787,62 +807,448 @@ def render_learning(db: DBManager) -> None:
     if df.empty:
         st.warning("設問データがありません。『データ入出力』からアップロードしてください。")
         return
-    with st.expander("フィルタ"):
-        years = st.multiselect("年度", sorted(df["year"].unique()), default=sorted(df["year"].unique()))
-        categories = st.multiselect("分野", CATEGORY_CHOICES, default=CATEGORY_CHOICES)
-        difficulties = st.slider("難易度", 1, 5, (1, 5))
+    tabs = st.tabs(["本試験モード", "分野別ドリル", "年度別演習", "弱点克服モード"])
+    with tabs[0]:
+        render_full_exam_lane(db, df)
+    with tabs[1]:
+        render_subject_drill_lane(db, df)
+    with tabs[2]:
+        render_year_drill_lane(db, df)
+    with tabs[3]:
+        render_weakness_lane(db, df)
+
+
+def render_full_exam_lane(db: DBManager, df: pd.DataFrame) -> None:
+    st.subheader("本試験モード")
+    st.caption("50問・120分の本試験同等環境で得点力と時間配分をチェックします。")
+    if len(df) < 50:
+        st.info("50問の出題には最低50問のデータが必要です。データを追加してください。")
+        return
+    session: Optional[ExamSession] = st.session_state.get("exam_session")
+    if session is None or session.mode != "本試験モード":
+        if st.button("50問模試を開始", key="start_full_exam"):
+            questions = stratified_exam(df)
+            if not questions:
+                st.warning("出題可能な問題が不足しています。")
+                return
+            st.session_state.pop("exam_result_本試験モード", None)
+            st.session_state["exam_session"] = ExamSession(
+                id=None,
+                name=f"本試験モード {dt.datetime.now():%Y%m%d-%H%M}",
+                questions=questions,
+                started_at=dt.datetime.now(),
+                year_mode="層化ランダム50",
+                mode="本試験モード",
+            )
+            session = st.session_state.get("exam_session")
+    session = st.session_state.get("exam_session")
+    if session and session.mode == "本試験モード":
+        render_exam_session_body(db, df, session, key_prefix="main_exam")
+    result = st.session_state.get("exam_result_本試験モード")
+    if result:
+        display_exam_result(result)
+
+
+def render_subject_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
+    st.subheader("分野別ドリル")
+    st.caption("民法・借地借家法・都市計画法・建築基準法・税・鑑定評価・宅建業法といったテーマをピンポイントで鍛えます。")
+    with st.expander("出題条件", expanded=True):
+        categories = st.multiselect(
+            "分野",
+            CATEGORY_CHOICES,
+            default=CATEGORY_CHOICES,
+            key="subject_categories",
+        )
+        topic_options = sorted({t for t in df["topic"].dropna().unique() if str(t).strip()})
+        selected_topics = st.multiselect(
+            "テーマ",
+            topic_options,
+            default=[],
+            key="subject_topics",
+        )
+        difficulties = st.slider("難易度", 1, 5, (1, 5), key="subject_difficulty")
+        keyword = st.text_input("キーワードで絞り込み (問題文/タグ)", key="subject_keyword")
     filtered = df[
-        df["year"].isin(years)
-        & df["category"].isin(categories)
+        df["category"].isin(categories)
         & df["difficulty"].between(difficulties[0], difficulties[1])
     ]
+    if selected_topics:
+        filtered = filtered[filtered["topic"].isin(selected_topics)]
+    if keyword:
+        keyword_lower = keyword.lower()
+        filtered = filtered[
+            filtered["question"].str.lower().str.contains(keyword_lower)
+            | filtered["tags"].fillna("").str.lower().str.contains(keyword_lower)
+        ]
     if filtered.empty:
-        st.warning("該当する設問がありません。条件を調整してください。")
+        st.warning("条件に合致する問題がありません。フィルタを調整してください。")
         return
-    question_id = st.selectbox("出題", filtered["id"], format_func=lambda x: format_question_label(filtered, x))
+    question_id = st.selectbox(
+        "出題問題",
+        filtered["id"],
+        format_func=lambda x: format_question_label(filtered, x),
+        key="subject_question_select",
+    )
     row = filtered[filtered["id"] == question_id].iloc[0]
-    st.subheader(f"{row['year']}年 問{row['q_no']}")
+    render_question_interaction(db, row, attempt_mode="subject_drill", key_prefix="subject")
+
+
+def render_year_drill_lane(db: DBManager, df: pd.DataFrame) -> None:
+    st.subheader("年度別演習")
+    st.caption("年度ごとの出題を通し演習し、本試験本番と同じ流れで知識を定着させます。")
+    years = sorted(df["year"].unique(), reverse=True)
+    if not years:
+        st.info("年度情報が登録されていません。データを確認してください。")
+        return
+    selected_year = st.selectbox("年度", years, key="year_drill_year")
+    subset = df[df["year"] == selected_year].sort_values("q_no")
+    if subset.empty:
+        st.warning("選択した年度の問題がありません。")
+        return
+    total = len(subset)
+    progress_key = "year_drill_index"
+    stored_year_key = "year_drill_current_year"
+    if st.session_state.get(stored_year_key) != selected_year:
+        st.session_state[stored_year_key] = selected_year
+        st.session_state[progress_key] = 0
+    index = st.session_state.get(progress_key, 0)
+    index = max(0, min(index, total - 1))
+    current_row = subset.iloc[index]
+    st.progress((index + 1) / total)
+    st.caption(f"{index + 1}/{total} 問を学習中")
+    render_question_interaction(db, current_row, attempt_mode="year_drill", key_prefix="year")
+    col_prev, col_next = st.columns(2)
+    with col_prev:
+        if st.button("前の問題", disabled=index == 0, key="year_prev"):
+            st.session_state[progress_key] = max(0, index - 1)
+    with col_next:
+        if st.button("次の問題", disabled=index >= total - 1, key="year_next"):
+            st.session_state[progress_key] = min(total - 1, index + 1)
+
+
+def render_weakness_lane(db: DBManager, df: pd.DataFrame) -> None:
+    st.subheader("弱点克服モード")
+    st.caption("誤答・低正答率・時間超過が目立つ問題を優先的に出題し、得点の底上げを図ります。")
+    attempts = db.get_attempt_stats()
+    if attempts.empty:
+        st.info("学習履歴がまだありません。本試験モードやドリルで取り組んでみましょう。")
+        return
+    summary = (
+        attempts.groupby(["question_id", "category"])
+        .agg(
+            attempts_count=("is_correct", "count"),
+            correct_count=("is_correct", "sum"),
+            avg_seconds=("seconds", "mean"),
+        )
+        .reset_index()
+    )
+    summary["accuracy"] = summary["correct_count"] / summary["attempts_count"].replace(0, np.nan)
+    summary["accuracy"] = summary["accuracy"].fillna(0)
+    summary["avg_seconds"] = summary["avg_seconds"].fillna(0)
+    summary["priority"] = (1 - summary["accuracy"]) * summary["attempts_count"] + np.where(
+        summary["avg_seconds"] > 90,
+        1,
+        0,
+    )
+    merged = summary.merge(df[["id", "year", "q_no", "question"]], left_on="question_id", right_on="id", how="left")
+    merged = merged.sort_values(["priority", "accuracy"], ascending=[False, True])
+    st.markdown("#### 優先出題リスト")
+    st.dataframe(
+        merged.head(10)[
+            [
+                "question_id",
+                "category",
+                "year",
+                "q_no",
+                "accuracy",
+                "attempts_count",
+                "avg_seconds",
+            ]
+        ].rename(
+            columns={
+                "question_id": "問題ID",
+                "category": "分野",
+                "year": "年度",
+                "q_no": "問",
+                "accuracy": "正答率",
+                "attempts_count": "挑戦回数",
+                "avg_seconds": "平均解答時間(秒)",
+            }
+        ),
+        use_container_width=True,
+    )
+    candidates = merged[~merged["id"].isna()]
+    if candidates.empty:
+        st.info("弱点候補の問題を特定できませんでした。履歴を増やしましょう。")
+        return
+    selected_qid = st.selectbox(
+        "復習する問題",
+        candidates["id"],
+        format_func=lambda x: format_question_label(df, x),
+        key="weakness_question",
+    )
+    row = df[df["id"] == selected_qid].iloc[0]
+    render_question_interaction(db, row, attempt_mode="weakness", key_prefix="weakness")
+
+
+def render_exam_session_body(
+    db: DBManager,
+    df: pd.DataFrame,
+    session: ExamSession,
+    key_prefix: str,
+    pass_line: float = 0.7,
+) -> None:
+    st.subheader(session.name)
+    if st.session_state["settings"].get("timer", True):
+        elapsed = dt.datetime.now() - session.started_at
+        remaining = max(0, 120 * 60 - int(elapsed.total_seconds()))
+        minutes, seconds = divmod(remaining, 60)
+        st.info(f"残り時間: {minutes:02d}:{seconds:02d}")
+    responses: Dict[str, int] = {}
+    choice_labels = ["①", "②", "③", "④"]
+    for qid in session.questions:
+        row_df = df[df["id"] == qid]
+        if row_df.empty:
+            continue
+        row = row_df.iloc[0]
+        st.markdown(f"### {row['year']}年 問{row['q_no']}")
+        st.markdown(f"**{row['category']} / {row['topic']}**")
+        render_law_reference(row)
+        st.markdown(row["question"], unsafe_allow_html=True)
+        options = [row.get(f"choice{i}", "") for i in range(1, 5)]
+        option_map = {
+            idx + 1: f"{choice_labels[idx]} {options[idx]}" if options[idx] else choice_labels[idx]
+            for idx in range(4)
+        }
+        choice = st.radio(
+            f"回答 ({qid})",
+            list(option_map.keys()),
+            format_func=lambda opt: option_map.get(opt, str(opt)),
+            key=f"{key_prefix}_exam_{qid}",
+            horizontal=True,
+            index=None,
+        )
+        if choice is not None:
+            responses[qid] = choice
+    if st.button("採点する", key=f"{key_prefix}_grade"):
+        evaluate_exam_attempt(db, df, session, responses, pass_line)
+
+
+def evaluate_exam_attempt(
+    db: DBManager,
+    df: pd.DataFrame,
+    session: ExamSession,
+    responses: Dict[str, int],
+    pass_line: float,
+) -> None:
+    total_questions = len(session.questions)
+    correct = 0
+    per_category: Dict[str, Dict[str, int]] = {}
+    wrong_choices: List[Dict[str, object]] = []
+    attempt_records: List[Tuple[str, int, bool]] = []
+    duration = max((dt.datetime.now() - session.started_at).total_seconds(), 1)
+    avg_seconds = duration / max(len(responses), 1)
+    for qid in session.questions:
+        row_df = df[df["id"] == qid]
+        if row_df.empty:
+            continue
+        row = row_df.iloc[0]
+        correct_choice = int(row.get("correct") or 0)
+        choice = responses.get(qid)
+        is_correct = choice is not None and correct_choice == choice
+        if is_correct:
+            correct += 1
+        category = row.get("category", "その他")
+        stats = per_category.setdefault(category, {"total": 0, "correct": 0})
+        stats["total"] += 1
+        if is_correct:
+            stats["correct"] += 1
+        attempt_records.append((qid, choice, is_correct))
+        if not is_correct and correct_choice in range(1, 5):
+            wrong_choices.append(
+                {
+                    "question": f"{row['year']}年 問{row['q_no']}",
+                    "selected": choice,
+                    "correct": correct_choice,
+                    "category": category,
+                }
+            )
+    finished_at = dt.datetime.now()
+    exam_id = db.log_exam_result(
+        {
+            "name": session.name,
+            "started_at": session.started_at,
+            "finished_at": finished_at,
+            "year_mode": session.year_mode,
+            "score": correct,
+        }
+    )
+    for qid, choice, is_correct in attempt_records:
+        db.record_attempt(
+            qid,
+            choice,
+            is_correct,
+            seconds=int(avg_seconds),
+            mode=session.mode,
+            exam_id=exam_id,
+        )
+    accuracy = correct / max(total_questions, 1)
+    remaining_time = max(0, 120 * 60 - int(duration))
+    answered = len(responses)
+    unanswered = total_questions - answered
+    expected_final = correct + unanswered * (correct / max(answered, 1)) if answered else 0
+    result_payload = {
+        "score": correct,
+        "total": total_questions,
+        "accuracy": accuracy,
+        "pass_line": pass_line,
+        "per_category": per_category,
+        "wrong_choices": wrong_choices,
+        "remaining_time": remaining_time,
+        "expected_final": expected_final,
+        "mode": session.mode,
+        "exam_id": exam_id,
+    }
+    st.session_state[f"exam_result_{session.mode}"] = result_payload
+    st.session_state["exam_session"] = None
+
+
+def display_exam_result(result: Dict[str, object]) -> None:
+    score = result["score"]
+    total = result["total"]
+    accuracy = result["accuracy"]
+    pass_line = result["pass_line"]
+    status = "✅ 合格ライン到達" if accuracy >= pass_line else "⚠️ 合格ライン未達"
+    st.markdown(f"### 採点結果 — {status}")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("得点", f"{score} / {total}")
+    with col2:
+        st.metric("正答率", f"{accuracy * 100:.1f}%")
+    with col3:
+        threshold = int(total * pass_line)
+        st.metric("合格ライン", f"{threshold} 点")
+    st.progress(min(accuracy / max(pass_line, 1e-6), 1.0))
+    remaining_minutes, remaining_seconds = divmod(int(result["remaining_time"]), 60)
+    st.metric(
+        "残り時間 × 想定到達点",
+        f"{remaining_minutes:02d}:{remaining_seconds:02d} / {result['expected_final']:.1f} 点",
+    )
+    if result["per_category"]:
+        radar_df = pd.DataFrame(
+            [
+                {
+                    "category": category,
+                    "accuracy": stats["correct"] / max(stats["total"], 1),
+                }
+                for category, stats in result["per_category"].items()
+            ]
+        )
+        if not radar_df.empty:
+            import altair as alt
+
+            radar_df = pd.concat([radar_df, radar_df.iloc[[0]]], ignore_index=True)
+            chart = (
+                alt.Chart(radar_df)
+                .mark_line(closed=True)
+                .encode(
+                    theta=alt.Theta("category", sort=None),
+                    radius=alt.Radius("accuracy", scale=alt.Scale(domain=[0, 1])),
+                )
+                .properties(title="分野別スコアレーダー")
+            )
+            points = (
+                alt.Chart(radar_df)
+                .mark_point(size=80)
+                .encode(
+                    theta=alt.Theta("category", sort=None),
+                    radius=alt.Radius("accuracy", scale=alt.Scale(domain=[0, 1])),
+                )
+            )
+            st.altair_chart(chart + points, use_container_width=True)
+    wrong_choices = result.get("wrong_choices", [])
+    if wrong_choices:
+        st.markdown("#### 誤答の代替正解肢傾向")
+        wrong_df = pd.DataFrame(wrong_choices)
+        option_map = {1: "①", 2: "②", 3: "③", 4: "④"}
+        wrong_df["選択肢"] = wrong_df["selected"].map(option_map).fillna("未回答")
+        wrong_df["正解肢"] = wrong_df["correct"].map({1: "①", 2: "②", 3: "③", 4: "④"})
+        st.dataframe(
+            wrong_df[["question", "category", "選択肢", "正解肢"]],
+            use_container_width=True,
+        )
+
+
+def render_question_interaction(
+    db: DBManager,
+    row: pd.Series,
+    attempt_mode: str,
+    key_prefix: str,
+) -> None:
+    last_question_key = f"{key_prefix}_last_question"
+    feedback_key = f"{key_prefix}_feedback"
+    if st.session_state.get(last_question_key) != row["id"]:
+        st.session_state[last_question_key] = row["id"]
+        st.session_state.pop(feedback_key, None)
+    st.markdown(f"### {row['year']}年 問{row['q_no']}")
     st.markdown(f"**{row['category']} / {row['topic']}**")
+    render_law_reference(row)
     st.markdown(row["question"], unsafe_allow_html=True)
-    choices = [row[f"choice{i}"] for i in range(1, 5)]
+    choices = [row.get(f"choice{i}", "") for i in range(1, 5)]
+    order = list(range(4))
     if st.session_state["settings"].get("shuffle_choices", True):
-        random.seed(question_id)
-        order = list(range(4))
+        random.seed(f"{row['id']}_{attempt_mode}")
         random.shuffle(order)
-    else:
-        order = list(range(4))
     choice_labels = ["①", "②", "③", "④"]
     selected = st.radio(
         "解答を選択",
         order,
         format_func=lambda idx: f"{choice_labels[idx]} {choices[idx]}",
-        key=f"answer_{question_id}",
+        key=f"{key_prefix}_answer_{row['id']}",
+        index=None,
     )
-    if st.button("採点", key=f"grade_{question_id}"):
+    if st.button("採点", key=f"{key_prefix}_grade_{row['id']}"):
         correct_choice = row.get("correct")
         if pd.isna(correct_choice):
             st.warning("正答が未登録の問題です。解答データを取り込んでください。")
         else:
             correct_choice = int(correct_choice)
             is_correct = (selected + 1) == correct_choice
-            db.record_attempt(question_id, selected + 1, is_correct, seconds=0, mode="learning")
-            st.success("正解です！" if is_correct else f"不正解。正答は {choice_labels[correct_choice - 1]}")
+            db.record_attempt(row["id"], selected + 1, is_correct, seconds=0, mode=attempt_mode)
+            st.session_state[feedback_key] = {
+                "is_correct": is_correct,
+                "correct_choice": correct_choice,
+                "question_id": row["id"],
+            }
+    feedback = st.session_state.get(feedback_key)
+    if feedback and feedback.get("question_id") == row["id"]:
+        message = "正解です！" if feedback["is_correct"] else f"不正解。正答は {choice_labels[feedback['correct_choice'] - 1]}"
+        (st.success if feedback["is_correct"] else st.error)(message)
         st.markdown("#### 解説")
         st.write(row.get("explanation", "解説が未登録です。"))
-        similar = compute_similarity(question_id)
+        similar = compute_similarity(row["id"])
         if not similar.empty:
             st.markdown("#### 類似問題")
             st.dataframe(similar)
-        if st.button("要復習に追加", key=f"srs_{question_id}"):
-            srs_row = fetch_srs_row(db, question_id)
+        if st.button("要復習に追加", key=f"{key_prefix}_srs_{row['id']}"):
+            srs_row = fetch_srs_row(db, row["id"])
             payload = sm2_update(srs_row, grade=2)
-            db.upsert_srs(question_id, payload)
+            db.upsert_srs(row["id"], payload)
             st.toast("SRSに追加しました", icon="✅")
-
 
 def format_question_label(df: pd.DataFrame, question_id: str) -> str:
     row = df[df["id"] == question_id].iloc[0]
     return f"{row['year']}年 問{row['q_no']} ({row['category']})"
+
+
+def render_law_reference(row: pd.Series) -> None:
+    query_source = row.get("tags") or row.get("topic") or row.get("category")
+    if query_source:
+        query = quote_plus(str(query_source).split(";")[0])
+        url = LAW_REFERENCE_BASE_URL.format(query=query)
+        st.caption(f"{LAW_BASELINE_LABEL} ｜ [条文検索]({url})")
+    else:
+        st.caption(LAW_BASELINE_LABEL)
 
 
 def fetch_srs_row(db: DBManager, question_id: str) -> Optional[pd.Series]:
@@ -876,56 +1282,21 @@ def render_mock_exam(db: DBManager) -> None:
             questions = stratified_exam(df)
         submit = st.form_submit_button("模試開始")
     if submit:
+        st.session_state.pop("exam_result_模試", None)
         st.session_state["exam_session"] = ExamSession(
             id=None,
             name=f"模試 {dt.datetime.now():%Y%m%d-%H%M}",
             questions=questions,
             started_at=dt.datetime.now(),
             year_mode=year_mode,
+            mode="模試",
         )
     session: Optional[ExamSession] = st.session_state.get("exam_session")
-    if session is None:
-        return
-    st.subheader(session.name)
-    if st.session_state["settings"].get("timer", True):
-        elapsed = dt.datetime.now() - session.started_at
-        remaining = max(0, 120 * 60 - int(elapsed.total_seconds()))
-        minutes, seconds = divmod(remaining, 60)
-        st.info(f"残り時間: {minutes:02d}:{seconds:02d}")
-    responses = {}
-    correct_count = 0
-    for qid in session.questions:
-        row = df[df["id"] == qid]
-        if row.empty:
-            continue
-        row = row.iloc[0]
-        st.markdown(f"### {row['year']}年 問{row['q_no']}")
-        st.markdown(row["question"], unsafe_allow_html=True)
-        choices = [row.get(f"choice{i}", "") for i in range(1, 5)]
-        choice_labels = ["①", "②", "③", "④"]
-        option_text = {
-            idx + 1: f"{choice_labels[idx]} {choices[idx]}" if choices[idx] else choice_labels[idx]
-            for idx in range(4)
-        }
-        choice = st.radio(
-            f"回答: {qid}",
-            list(range(1, 5)),
-            key=f"exam_{qid}",
-            horizontal=True,
-            format_func=lambda opt: option_text.get(opt, str(opt)),
-        )
-        responses[qid] = choice
-        if row.get("correct") == choice:
-            correct_count += 1
-    if st.button("採点する"):
-        score = correct_count
-        st.success(f"得点: {score} 点")
-        st.progress(score / max(len(session.questions), 1))
-        for qid, choice in responses.items():
-            row = df[df["id"] == qid].iloc[0]
-            is_correct = row.get("correct") == choice
-            db.record_attempt(qid, choice, is_correct, seconds=0, mode="exam")
-        st.session_state["exam_session"] = None
+    if session and session.mode == "模試":
+        render_exam_session_body(db, df, session, key_prefix="mock")
+    result = st.session_state.get("exam_result_模試")
+    if result:
+        display_exam_result(result)
 
 
 def render_srs(db: DBManager) -> None:
