@@ -656,13 +656,27 @@ class DBManager:
                 resolved_id: Optional[str] = None
 
                 if rec_id and rec_id in existing_ids:
-                    conn.execute(
-                        update(questions_table)
-                        .where(questions_table.c.id == rec_id)
-                        .values(**update_values)
-                    )
+                    target_id = rec_id
+                    try:
+                        conn.execute(
+                            update(questions_table)
+                            .where(questions_table.c.id == target_id)
+                            .values(**update_values)
+                        )
+                    except IntegrityError:
+                        fallback_id = existing_pairs.get(year_qno)
+                        if fallback_id and fallback_id != rec_id:
+                            conn.execute(
+                                update(questions_table)
+                                .where(questions_table.c.id == fallback_id)
+                                .values(**update_values)
+                            )
+                            target_id = fallback_id
+                        else:
+                            raise
                     updated += 1
-                    resolved_id = rec_id
+                    resolved_id = target_id
+                    existing_ids.add(target_id)
                 elif year_qno in existing_pairs:
                     existing_id = existing_pairs[year_qno]
                     if existing_id:
