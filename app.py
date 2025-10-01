@@ -417,7 +417,6 @@ def safe_rerun() -> None:
 def with_rerun(callback: Callable[..., None], *args, **kwargs) -> Callable[[], None]:
     def _inner() -> None:
         callback(*args, **kwargs)
-        safe_rerun()
 
     return _inner
 
