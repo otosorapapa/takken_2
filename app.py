@@ -17,7 +17,7 @@ from urllib.parse import quote_plus
 import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit.components.v1 import html
+from streamlit.components.v1 import html as components_html
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -250,7 +250,7 @@ def inject_style(css: str, style_id: str) -> None:
         </script>
         """
     ).substitute(css=css_payload, style_id=style_id_payload)
-    html(script, height=0)
+    components_html(script, height=0)
 
 
 def ensure_schema_migrations(engine: Engine) -> None:
@@ -1942,7 +1942,7 @@ def compute_most_improved_topic(attempts: pd.DataFrame, df: pd.DataFrame) -> Opt
 def register_keyboard_shortcuts(mapping: Dict[str, str]) -> None:
     if not mapping:
         return
-    html(
+    components_html(
         """
         <script>
         (function() {
