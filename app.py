@@ -35,6 +35,10 @@ REJECT_DIR = DATA_DIR / "rejects"
 OFFLINE_EXPORT_DIR = DATA_DIR / "offline_exports"
 MAPPING_KIND_QUESTIONS = "questions"
 MAPPING_KIND_ANSWERS = "answers"
+MAPPING_KIND_LABELS = {
+    MAPPING_KIND_QUESTIONS: "設問データ",
+    MAPPING_KIND_ANSWERS: "正答データ",
+}
 DEFAULT_CATEGORY_MAP = {
     "宅建業法": "宅建業法",
     "業法": "宅建業法",
@@ -1956,6 +1960,34 @@ def guess_dataset_kind(df: pd.DataFrame) -> str:
     if "correct_number" in cols or "correct_label" in cols or "correct_text" in cols:
         return MAPPING_KIND_ANSWERS
     return MAPPING_KIND_QUESTIONS
+
+
+def describe_dataset_name(raw_name: str) -> Tuple[str, Optional[str]]:
+    base_name = Path(raw_name).name
+    stem = Path(base_name).stem or base_name
+    suffix = Path(base_name).suffix.lower()
+    normalized = stem.strip() or base_name
+    lower = normalized.lower()
+    name_map = {
+        "questions": "設問データ",
+        "answers": "正答データ",
+        "predicted": "予想問題データ",
+        "law_revision": "法改正予想問題データ",
+    }
+    if lower in name_map:
+        return name_map[lower], base_name
+    hint: Optional[str] = None
+    if suffix in {".csv", ".tsv", ".txt"}:
+        hint = "CSVデータ"
+    elif suffix in {".xlsx", ".xls", ".xlsm"}:
+        hint = "Excelシート"
+    elif any(keyword in normalized for keyword in ["テーブル", "table", "Table"]):
+        hint = "表データ"
+    elif any(keyword in normalized for keyword in ["グラフ", "chart", "Chart"]):
+        hint = "グラフデータ"
+    if hint:
+        return f"{normalized}（{hint}）", base_name
+    return normalized, base_name if normalized != base_name else None
 
 
 def store_uploaded_file(file: "UploadedFile", timestamp: str) -> Path:
@@ -3979,12 +4011,17 @@ def render_data_io(db: DBManager) -> None:
 
     for dataset in datasets:
         df = dataset["data"]
-        st.subheader(dataset["name"])
+        display_name, original_name = describe_dataset_name(dataset["name"])
+        st.subheader(display_name)
+        if original_name and original_name != display_name:
+            st.caption(f"元のファイル/シート名: {original_name}")
         st.dataframe(df.head())
         kind = st.selectbox(
-            f"種別 ({dataset['name']})",
+            f"データ種別 ({display_name})",
             [MAPPING_KIND_QUESTIONS, MAPPING_KIND_ANSWERS],
             index=0 if dataset["kind"] == MAPPING_KIND_QUESTIONS else 1,
+            format_func=lambda value: MAPPING_KIND_LABELS.get(value, value),
+            help="アップロードした表が設問データか正答データかを選択してください。",
         )
         dataset["kind"] = kind
         columns = df.columns.tolist()
