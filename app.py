@@ -2103,12 +2103,14 @@ def main() -> None:
         "統計",
         "設定",
     ]
+    nav_value = st.session_state.get("nav", "ホーム")
+    if nav_value not in menu_options:
+        nav_value = "ホーム"
+        st.session_state["nav"] = nav_value
     sidebar.radio(
         "メニュー",
         menu_options,
-        index=menu_options.index(
-            st.session_state.get("nav", "ホーム")
-        ),
+        index=menu_options.index(nav_value),
         key="_nav_widget",
         on_change=with_rerun(handle_nav_change),
     )
