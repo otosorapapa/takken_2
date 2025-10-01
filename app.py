@@ -50,15 +50,6 @@ DIFFICULTY_DEFAULT = 3
 LAW_BASELINE_LABEL = "適用法令基準日（R6/4/1）"
 LAW_REFERENCE_BASE_URL = "https://elaws.e-gov.go.jp/search?q={query}"
 
-GLOBAL_SEARCH_SUGGESTIONS = [
-    "重要事項説明",
-    "抵当権",
-    "都市計画法",
-    "宅建業免許",
-    "宅地建物取引士",
-    "瑕疵担保",
-]
-
 FONT_SIZE_SCALE = {
     "やや小さい": 0.95,
     "標準": 1.0,
@@ -337,73 +328,6 @@ def apply_user_preferences() -> None:
     inject_style(base_css + theme_css, "takken-theme-styles")
 
 
-def build_search_dictionary(df: pd.DataFrame) -> List[str]:
-    tokens: Set[str] = set(GLOBAL_SEARCH_SUGGESTIONS + CATEGORY_CHOICES)
-    empty_series = pd.Series(dtype="object")
-    tokens.update(str(cat).strip() for cat in df.get("category", empty_series).dropna())
-    tokens.update(str(topic).strip() for topic in df.get("topic", empty_series).dropna())
-    for tags in df.get("tags", empty_series).dropna():
-        for token in re.split(r"[\s,;、/\\|]+", str(tags)):
-            cleaned = token.strip()
-            if len(cleaned) >= 2:
-                tokens.add(cleaned)
-    tokens = {token for token in tokens if token}
-    return sorted(tokens)
-
-
-def match_search_suggestions(dictionary: List[str], query: str, limit: int = 6) -> List[str]:
-    if not dictionary:
-        return []
-    if not query:
-        return dictionary[:limit]
-    query_lower = query.lower()
-    scored: List[Tuple[float, str]] = []
-    for candidate in dictionary:
-        candidate_lower = candidate.lower()
-        score = fuzz.partial_ratio(query_lower, candidate_lower)
-        if candidate_lower.startswith(query_lower):
-            score += 20
-        scored.append((score, candidate))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    filtered = [candidate for score, candidate in scored if score >= 30]
-    if not filtered:
-        filtered = [candidate for _, candidate in scored[:limit]]
-    return filtered[:limit]
-
-
-def trigger_global_search() -> None:
-    raw_value = st.session_state.get("global_search_input", "")
-    query = str(raw_value or "").strip()
-    st.session_state["global_search_input"] = raw_value
-    st.session_state["_global_search_input_widget"] = raw_value
-    st.session_state["global_search_query"] = query
-    st.session_state["global_search_submitted"] = bool(query)
-
-
-def clear_global_search() -> None:
-    st.session_state["global_search_input"] = ""
-    st.session_state["_global_search_input_widget"] = ""
-    st.session_state["global_search_query"] = ""
-    st.session_state["global_search_submitted"] = False
-    st.session_state.pop("global_search_pending", None)
-
-
-def request_clear_global_search() -> None:
-    st.session_state["global_search_should_clear"] = True
-
-
-def set_global_search_query(query: str) -> None:
-    normalized = str(query or "").strip()
-    st.session_state["global_search_pending"] = {
-        "query": normalized,
-        "submitted": bool(normalized),
-    }
-    st.session_state["global_search_input"] = normalized
-    st.session_state["_global_search_input_widget"] = normalized
-    st.session_state["global_search_query"] = normalized
-    st.session_state["global_search_submitted"] = bool(normalized)
-
-
 def safe_rerun() -> None:
     rerun = getattr(st, "rerun", None)
     experimental_rerun = getattr(st, "experimental_rerun", None)
@@ -420,21 +344,6 @@ def with_rerun(callback: Callable[..., None], *args, **kwargs) -> Callable[[], N
         safe_rerun()
 
     return _inner
-
-
-def handle_global_search_input_change() -> None:
-    st.session_state["global_search_input"] = st.session_state.get("_global_search_input_widget", "")
-    trigger_global_search()
-
-
-def handle_global_search_submit() -> None:
-    st.session_state["global_search_input"] = st.session_state.get("_global_search_input_widget", "")
-    trigger_global_search()
-
-
-def handle_global_search_clear() -> None:
-    request_clear_global_search()
-    clear_global_search()
 
 
 def handle_nav_change() -> None:
@@ -1767,157 +1676,6 @@ def render_offline_downloads(key_prefix: str) -> None:
         st.caption(f"ファイルは {OFFLINE_EXPORT_DIR.as_posix()} にも自動保存されます。")
 
 
-def build_snippet(text: str, keyword: str, width: int = 80) -> str:
-    if not text:
-        return ""
-    pattern = re.compile(re.escape(keyword), re.IGNORECASE)
-    match = pattern.search(text)
-    cleaned = re.sub(r"\s+", " ", text)
-    if not match:
-        return (cleaned[:width] + "…") if len(cleaned) > width else cleaned
-    start = max(0, match.start() - width // 2)
-    end = min(len(cleaned), match.end() + width // 2)
-    snippet = cleaned[start:end]
-    if start > 0:
-        snippet = "…" + snippet
-    if end < len(cleaned):
-        snippet = snippet + "…"
-    return snippet
-
-
-def search_questions(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    keywords = [kw.strip() for kw in re.split(r"[\s　]+", query) if kw.strip()]
-    if not keywords:
-        return df.iloc[0:0]
-    mask = pd.Series(True, index=df.index)
-    choice_cols = [f"choice{i}" for i in range(1, 5)]
-    for kw in keywords:
-        pattern = re.escape(kw)
-        col_mask = df["question"].fillna("").str.contains(pattern, case=False, na=False)
-        col_mask |= df["topic"].fillna("").str.contains(pattern, case=False, na=False)
-        col_mask |= df["tags"].fillna("").str.contains(pattern, case=False, na=False)
-        for col in choice_cols:
-            col_mask |= df[col].fillna("").str.contains(pattern, case=False, na=False)
-        mask &= col_mask
-    results = df[mask].copy()
-    if results.empty:
-        return results
-    primary = keywords[0]
-    results["snippet"] = results.apply(
-        lambda row: build_snippet(
-            "\n".join(
-                [
-                    str(row.get("question", "")),
-                    *(str(row.get(f"choice{i}", "")) for i in range(1, 5)),
-                    str(row.get("explanation", "")),
-                ]
-            ),
-            primary,
-        ),
-        axis=1,
-    )
-    return results
-
-
-def render_global_search_panel(db: DBManager, df: pd.DataFrame, query: str) -> None:
-    st.markdown("## 🔍 横断検索結果")
-    results = search_questions(df, query)
-    if results.empty:
-        st.info("該当する問題が見つかりませんでした。フィルタやキーワードを見直してください。")
-        return
-    with st.expander("並び替え・フィルタ", expanded=False):
-        category_options = sorted({str(cat) for cat in results["category"].dropna()})
-        selected_categories = st.multiselect(
-            "分野で絞り込み",
-            category_options,
-            default=category_options,
-            help="興味のある分野だけを表示します。",
-            key="global_search_categories",
-        )
-        year_values = sorted({int(y) for y in results["year"].dropna().astype(int)})
-        year_range: Optional[Tuple[int, int]]
-        if year_values:
-            min_year, max_year = year_values[0], year_values[-1]
-            if min_year == max_year:
-                st.caption(f"年度フィルタ: {min_year}年のみのデータです。")
-                year_range = (min_year, max_year)
-            else:
-                year_range = st.slider(
-                    "年度範囲",
-                    min_year,
-                    max_year,
-                    (min_year, max_year),
-                    help="学習したい年度に絞り込めます。",
-                    key="global_search_year_range",
-                )
-        else:
-            year_range = None
-        snippet_keyword = st.text_input(
-            "要約内フィルタ",
-            key="global_search_snippet_filter",
-            help="要約に含まれる語句でさらに絞り込みます。",
-        )
-        sort_option = st.selectbox(
-            "並び順",
-            ["関連度順", "年度 (新しい順)", "年度 (古い順)", "問番昇順"],
-            help="検索結果の表示順序を変更できます。",
-            key="global_search_sort",
-        )
-    filtered = results.copy()
-    if selected_categories:
-        filtered = filtered[filtered["category"].isin(selected_categories)]
-    if year_range:
-        filtered = filtered[filtered["year"].between(year_range[0], year_range[1])]
-    if snippet_keyword:
-        filtered = filtered[
-            filtered["snippet"].str.contains(snippet_keyword, case=False, na=False)
-            | filtered["question"].str.contains(snippet_keyword, case=False, na=False)
-        ]
-    if filtered.empty:
-        st.info("条件に合致する結果がありません。フィルタを緩めて再検索してください。")
-        return
-    if sort_option == "年度 (新しい順)":
-        filtered = filtered.sort_values(["year", "q_no"], ascending=[False, True])
-    elif sort_option == "年度 (古い順)":
-        filtered = filtered.sort_values(["year", "q_no"], ascending=[True, True])
-    elif sort_option == "問番昇順":
-        filtered = filtered.sort_values(["q_no", "year"], ascending=[True, False])
-    else:
-        filtered = filtered.sort_values(["year", "q_no"], ascending=[False, True])
-    display = filtered.head(30)
-    summary_df = display[
-        ["year", "q_no", "category", "topic", "snippet", "id"]
-    ].rename(
-        columns={
-            "year": "年度",
-            "q_no": "問番",
-            "category": "分野",
-            "topic": "小分類",
-            "snippet": "要約",
-            "id": "問題ID",
-        }
-    )
-    st.dataframe(
-        summary_df.set_index("問題ID"),
-        use_container_width=True,
-        column_config={
-            "年度": st.column_config.NumberColumn("年度", format="%d", help="クリックで並び替えできます。"),
-            "問番": st.column_config.NumberColumn("問番", format="%d", help="問番号でソートできます。"),
-            "分野": st.column_config.TextColumn("分野", help="カテゴリ名にマウスオーバーすると全文が表示されます。"),
-            "小分類": st.column_config.TextColumn("小分類", help="細目分類での検索に役立ちます。"),
-            "要約": st.column_config.TextColumn("要約", help="問題文や解説から自動生成したサマリーです。"),
-        },
-    )
-    selected_id = st.selectbox(
-        "検索結果から問題を開く",
-        display["id"],
-        format_func=lambda x: format_question_label(df, x),
-        key="global_search_select",
-    )
-    row = df[df["id"] == selected_id].iloc[0]
-    render_question_interaction(db, row, attempt_mode="search", key_prefix="search")
-
-
 def get_review_candidate_ids(db: DBManager) -> Set[str]:
     review_ids: Set[str] = set()
     attempts = db.get_attempt_stats()
@@ -2217,12 +1975,6 @@ def init_session_state() -> None:
         "attempt_start": None,
         "exam_session": None,
         "import_state": {},
-        "global_search_input": "",
-        "global_search_query": "",
-        "global_search_submitted": False,
-        "global_search_should_clear": False,
-        "global_search_pending": None,
-        "_global_search_input_widget": "",
         "settings": {
             "shuffle_choices": True,
             "theme": "セピア",
@@ -2243,23 +1995,11 @@ def init_session_state() -> None:
 def main() -> None:
     st.set_page_config(page_title="宅建10年ドリル", layout="wide")
     init_session_state()
-    if st.session_state.get("global_search_should_clear"):
-        clear_global_search()
-        st.session_state["global_search_should_clear"] = False
-    pending_search = st.session_state.pop("global_search_pending", None)
-    if pending_search:
-        query = str(pending_search.get("query", "") or "").strip()
-        submitted = bool(pending_search.get("submitted"))
-        st.session_state["global_search_input"] = query
-        st.session_state["global_search_query"] = query
-        st.session_state["global_search_submitted"] = submitted
-        st.session_state["_global_search_input_widget"] = query
     apply_user_preferences()
     engine = get_engine()
     db = DBManager(engine)
     db.initialize_from_csv()
     df = load_questions_df()
-    search_dictionary = build_search_dictionary(df)
 
     sidebar = st.sidebar
     sidebar.title("宅建10年ドリル")
@@ -2287,53 +2027,6 @@ def main() -> None:
     )
     nav = st.session_state.get("nav", "ホーム")
     sidebar.divider()
-    if st.session_state.get("_global_search_input_widget") != st.session_state.get("global_search_input"):
-        st.session_state["_global_search_input_widget"] = st.session_state.get("global_search_input", "")
-    sidebar.text_input(
-        "🔍 横断検索",
-        key="_global_search_input_widget",
-        placeholder="抵当権 代価弁済 / 再建築不可 など",
-        help="Enterキーまたは『検索』ボタンで実行します。",
-        on_change=with_rerun(handle_global_search_input_change),
-    )
-    suggestion_container = sidebar.container()
-    current_input = st.session_state.get("global_search_input", "")
-    suggestions = match_search_suggestions(search_dictionary, current_input)
-    if suggestions:
-        with suggestion_container:
-            st.caption("候補キーワード (クリックで検索欄に反映されます)")
-            suggestion_cols = st.columns(2)
-            for idx, keyword in enumerate(suggestions):
-                col = suggestion_cols[idx % 2]
-                col.button(
-                    keyword,
-                    key=f"global_suggest_{idx}",
-                    type="secondary",
-                    on_click=with_rerun(set_global_search_query, keyword),
-                )
-    search_action_cols = sidebar.columns(2)
-    search_action_cols[0].button(
-        "検索",
-        key="global_search_button",
-        on_click=with_rerun(handle_global_search_submit),
-    )
-    search_action_cols[1].button(
-        "条件クリア",
-        key="global_search_clear",
-        type="secondary",
-        on_click=with_rerun(handle_global_search_clear),
-    )
-    search_query = st.session_state.get("global_search_query", "")
-    with sidebar.expander("キーワードヒント", expanded=False):
-        st.caption("よく使う語句をクリックすると検索欄に自動入力されます。")
-        hint_cols = st.columns(2)
-        for idx, keyword in enumerate(GLOBAL_SEARCH_SUGGESTIONS):
-            hint_cols[idx % 2].button(
-                keyword,
-                key=f"global_search_hint_{idx}",
-                on_click=with_rerun(set_global_search_query, keyword),
-            )
-        search_query = st.session_state.get("global_search_query", "")
     with sidebar.expander("モード別の使い方ガイド", expanded=False):
         st.markdown(
             "\n".join(
@@ -2350,10 +2043,6 @@ def main() -> None:
                 ]
             )
         )
-
-    if search_query and st.session_state.get("global_search_submitted"):
-        render_global_search_panel(db, df, search_query)
-        st.divider()
 
     if nav == "ホーム":
         render_home(db, df)
