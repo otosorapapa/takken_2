@@ -622,7 +622,11 @@ class DBManager:
                 existing_pairs = {}
 
             for rec in records:
+                if "id" in rec and isinstance(rec["id"], str):
+                    rec["id"] = rec["id"].strip()
                 rec_id = rec.get("id")
+                if not rec_id:
+                    rec_id = None
                 year_qno = (rec.get("year"), rec.get("q_no"))
                 update_values = {k: v for k, v in rec.items() if k != "id"}
 
@@ -959,8 +963,13 @@ def normalize_questions(df: pd.DataFrame, mapping: Optional[Dict[str, str]] = No
         .astype(int)
     )
     df["tags"] = df.get("tags", "").fillna("")
+    if "id" in df.columns:
+        df["id"] = df["id"].astype("string").str.strip()
+        mask_invalid_id = df["id"].isin(["", "nan", "None"]).fillna(False)
+        df.loc[mask_invalid_id, "id"] = pd.NA
     if "id" not in df.columns or df["id"].isna().any():
         df["id"] = df.apply(generate_question_id, axis=1)
+    df["id"] = df["id"].astype(str)
     df = df.drop_duplicates(subset=["id"])
     df = df[
         [
