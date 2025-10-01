@@ -626,28 +626,60 @@ class DBManager:
                 year_qno = (rec.get("year"), rec.get("q_no"))
                 update_values = {k: v for k, v in rec.items() if k != "id"}
 
-                if rec_id in existing_ids:
+                resolved_id: Optional[str] = None
+
+                if rec_id and rec_id in existing_ids:
                     conn.execute(
                         update(questions_table)
                         .where(questions_table.c.id == rec_id)
                         .values(**update_values)
                     )
                     updated += 1
+                    resolved_id = rec_id
                 elif year_qno in existing_pairs:
                     existing_id = existing_pairs[year_qno]
-                    conn.execute(
-                        update(questions_table)
-                        .where(questions_table.c.id == existing_id)
-                        .values(**update_values)
-                    )
-                    updated += 1
+                    if existing_id:
+                        conn.execute(
+                            update(questions_table)
+                            .where(questions_table.c.id == existing_id)
+                            .values(**update_values)
+                        )
+                        updated += 1
+                        resolved_id = existing_id
+                    else:
+                        # As a safety net, fetch the id using year and q_no if it's missing.
+                        result = conn.execute(
+                            select(questions_table.c.id)
+                            .where(questions_table.c.year == year_qno[0])
+                            .where(questions_table.c.q_no == year_qno[1])
+                        ).first()
+                        if result:
+                            existing_id = result[0]
+                            conn.execute(
+                                update(questions_table)
+                                .where(questions_table.c.id == existing_id)
+                                .values(**update_values)
+                            )
+                            updated += 1
+                            resolved_id = existing_id
                 else:
-                    conn.execute(sa_insert(questions_table).values(**rec))
+                    result = conn.execute(sa_insert(questions_table).values(**rec))
                     inserted += 1
-                    if rec_id:
-                        existing_ids.add(rec_id)
-                    if None not in year_qno:
-                        existing_pairs[year_qno] = rec_id
+                    inserted_id = rec_id
+                    if not inserted_id and result.inserted_primary_key:
+                        inserted_id = result.inserted_primary_key[0]
+                    if inserted_id:
+                        existing_ids.add(inserted_id)
+                        resolved_id = inserted_id
+
+                if rec_id and rec_id not in existing_ids:
+                    existing_ids.add(rec_id)
+
+                if (
+                    None not in year_qno
+                    and resolved_id
+                ):
+                    existing_pairs[year_qno] = resolved_id
         return inserted, updated
 
     def upsert_predicted_questions(self, df: pd.DataFrame) -> Tuple[int, int]:
