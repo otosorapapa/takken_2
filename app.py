@@ -637,7 +637,17 @@ class DBManager:
             for rec in records:
                 if "id" in rec and isinstance(rec["id"], str):
                     rec["id"] = rec["id"].strip()
+
                 rec_id = rec.get("id")
+                if not rec_id:
+                    year_val = rec.get("year")
+                    q_no_val = rec.get("q_no")
+                    question_text = rec.get("question", "")
+                    if year_val is None or q_no_val is None:
+                        raise ValueError("year と q_no は必須です")
+                    base = f"{year_val}|{q_no_val}|{str(question_text)[:80]}"
+                    rec_id = hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+                    rec["id"] = rec_id
                 if not rec_id:
                     rec_id = None
                 year_qno = (rec.get("year"), rec.get("q_no"))
@@ -681,36 +691,62 @@ class DBManager:
                             resolved_id = existing_id
                 else:
                     inserted_id = rec_id
-                    if self.engine.dialect.name == "sqlite":
-                        stmt = sqlite_insert(questions_table).values(**rec)
-                        stmt = stmt.on_conflict_do_update(
-                            index_elements=["year", "q_no"],
-                            set_=update_values,
-                        )
-                        result = conn.execute(stmt)
-                        primary_key = result.inserted_primary_key
-                        if primary_key:
-                            inserted += 1
-                            if not inserted_id:
-                                inserted_id = primary_key[0]
+                    try:
+                        if self.engine.dialect.name == "sqlite":
+                            stmt = sqlite_insert(questions_table).values(**rec)
+                            stmt = stmt.on_conflict_do_update(
+                                index_elements=["year", "q_no"],
+                                set_=update_values,
+                            )
+                            result = conn.execute(stmt)
+                            primary_key = result.inserted_primary_key
+                            if primary_key:
+                                inserted += 1
+                                if not inserted_id:
+                                    inserted_id = primary_key[0]
+                            else:
+                                existing_row = conn.execute(
+                                    select(questions_table.c.id)
+                                    .where(questions_table.c.year == year_qno[0])
+                                    .where(questions_table.c.q_no == year_qno[1])
+                                ).first()
+                                if existing_row:
+                                    resolved_id = existing_row[0]
+                                    updated += 1
+                                    if resolved_id:
+                                        existing_ids.add(resolved_id)
+                                        existing_pairs[year_qno] = resolved_id
+                                continue
                         else:
+                            result = conn.execute(sa_insert(questions_table).values(**rec))
+                            inserted += 1
+                            if not inserted_id and result.inserted_primary_key:
+                                inserted_id = result.inserted_primary_key[0]
+                    except IntegrityError:
+                        fallback_id = None
+                        if rec_id and rec_id in existing_ids:
+                            fallback_id = rec_id
+                        elif None not in year_qno:
                             existing_row = conn.execute(
                                 select(questions_table.c.id)
                                 .where(questions_table.c.year == year_qno[0])
                                 .where(questions_table.c.q_no == year_qno[1])
                             ).first()
                             if existing_row:
-                                resolved_id = existing_row[0]
-                                updated += 1
-                                if resolved_id:
-                                    existing_ids.add(resolved_id)
-                                    existing_pairs[year_qno] = resolved_id
+                                fallback_id = existing_row[0]
+                        if fallback_id:
+                            conn.execute(
+                                update(questions_table)
+                                .where(questions_table.c.id == fallback_id)
+                                .values(**update_values)
+                            )
+                            updated += 1
+                            resolved_id = fallback_id
+                            existing_ids.add(fallback_id)
+                            if None not in year_qno:
+                                existing_pairs[year_qno] = fallback_id
                             continue
-                    else:
-                        result = conn.execute(sa_insert(questions_table).values(**rec))
-                        inserted += 1
-                        if not inserted_id and result.inserted_primary_key:
-                            inserted_id = result.inserted_primary_key[0]
+                        raise
                     if inserted_id:
                         existing_ids.add(inserted_id)
                         resolved_id = inserted_id
